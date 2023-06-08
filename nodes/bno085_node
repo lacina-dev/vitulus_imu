@@ -114,7 +114,7 @@ if __name__ == '__main__':
         rate = 100
         r = rospy.Rate(rate)  # 100Hz
 
-        def signal_handler():
+        def signal_handler(signum, frame):
             node_bno085.uart.close()
             rospy.signal_shutdown("end")
             sys.exit(0)
