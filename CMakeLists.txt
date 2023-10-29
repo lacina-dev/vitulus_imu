@@ -51,6 +51,7 @@ install(DIRECTORY launch config rviz
 
 catkin_install_python(PROGRAMS
   nodes/bno085_node
+  nodes/bno085v2_node
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

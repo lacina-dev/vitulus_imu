@@ -1,0 +1,281 @@
+#!/usr/bin/env python
+import rospy
+from sensor_msgs.msg import MagneticField, Imu
+from sensor_msgs_ext.msg import magnetometer, accelerometer
+from vitulus_msgs.msg import Imu_status
+from std_msgs.msg import Bool
+import sys
+import serial
+import signal
+# import adafruit_bno08x
+# from adafruit_bno08x.uart import BNO08X_UART
+from bno085v2_node import adafruit_bno08xMOD
+from bno085v2_node.adafruit_bno08xMOD.uart import BNO08X_UART
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+
+
+class BNO085Node:
+
+    def __init__(self):
+        self.imu_pub = rospy.Publisher('bno085/imu', Imu, queue_size=10)
+        self.nevheading_pub = rospy.Publisher('bno085/navheading', Imu, queue_size=10)
+        self.mag_pub = rospy.Publisher('bno085/mag', MagneticField, queue_size=10)
+
+        self.mag_ext_pub = rospy.Publisher('/imu/magnetometer', magnetometer, queue_size=10)
+        self.acc_ext_pub = rospy.Publisher('/imu/accelerometer', accelerometer, queue_size=10)
+        self.sub_test = rospy.Subscriber("bno085/run_calibration", Bool, self.callback_run_calibration)
+        self.calibration_msg = Bool(True)
+        self.calibration_msg_received = False
+
+        rospy.loginfo("<{}> Connecting UART /dev/imu, baudrate 3000000...".format(rospy.get_caller_id()))
+        self.uart = serial.Serial("/dev/imu", baudrate=3000000)
+        self.bno = BNO08X_UART(self.uart, debug=False)
+        rospy.loginfo("<{}> UART connected.".format(rospy.get_caller_id()))
+
+        self.imu_status_pub = rospy.Publisher('bno085/imu_status', Imu_status, queue_size=10)
+        self.diag_pub = rospy.Publisher("/diagnostics", DiagnosticArray, queue_size=10)
+        self.msg_bno085_status = Imu_status()
+        self.msg_bno085_status.status = False
+        self.msg_bno085_status.header.stamp = rospy.Time.now()
+
+        self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_ACCELEROMETER)
+        self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_GYROSCOPE)
+        self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_MAGNETOMETER)
+        self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_ROTATION_VECTOR)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_LINEAR_ACCELERATION)
+        self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_GEOMAGNETIC_ROTATION_VECTOR)
+        self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_GAME_ROTATION_VECTOR)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_STEP_COUNTER)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_STABILITY_CLASSIFIER)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_ACTIVITY_CLASSIFIER)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_SHAKE_DETECTOR)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_RAW_ACCELEROMETER)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_RAW_GYROSCOPE)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_RAW_MAGNETOMETER)
+        # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_GYRO_INTEGRATED_ROTATION_VECTOR)
+
+    def callback_run_calibration(self, msg):
+        self.calibration_msg = msg
+        self.calibration_msg_received = True
+
+    def run_calibration(self):
+        if self.calibration_msg.data:
+            try:
+                self.bno.begin_calibration()
+                rospy.logwarn("<{}> Calibration started.".format(rospy.get_caller_id()))
+            except Exception as e:
+                rospy.logerr("<{}> Calibration failed. {}".format(rospy.get_caller_id(), str(e)))
+
+        else:
+            self.bno.save_calibration_data()
+            rospy.logwarn("<{}> Calibration data saved.".format(rospy.get_caller_id()))
+
+    def publish_imu_status(self):
+        self.msg_bno085_status.header.stamp = rospy.Time.now()
+        self.imu_status_pub.publish(self.msg_bno085_status)
+
+    def publish_imu(self):
+        acc_x, acc_y, acc_z = self.bno.acceleration
+        gyro_x, gyro_y, gyro_z = self.bno.gyro
+        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.quaternion
+        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.geomagnetic_quaternion
+        orientation_x, orientation_y, orientation_z, orientation_w = self.bno.game_quaternion
+        imu_msg = Imu()
+        imu_msg.header.stamp = rospy.Time.now()
+        imu_msg.header.frame_id = "bno_imu_link"
+        imu_msg.orientation.x = orientation_x
+        imu_msg.orientation.y = orientation_y
+        imu_msg.orientation.z = orientation_z
+        imu_msg.orientation.w = orientation_w
+        imu_msg.orientation_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.angular_velocity.x = gyro_x
+        imu_msg.angular_velocity.y = gyro_y
+        imu_msg.angular_velocity.z = gyro_z
+        imu_msg.angular_velocity_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.linear_acceleration.x = acc_x
+        imu_msg.linear_acceleration.y = acc_y
+        imu_msg.linear_acceleration.z = acc_z
+        imu_msg.linear_acceleration_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        if ((orientation_x + orientation_y + orientation_z + orientation_w) != 0.0):
+            self.imu_pub.publish(imu_msg)
+
+        imu_ext_msg = accelerometer()
+        imu_ext_msg.x = acc_x
+        imu_ext_msg.y = acc_y
+        imu_ext_msg.z = acc_z
+        self.acc_ext_pub.publish(imu_ext_msg)
+
+
+    def publish_mag(self):
+        mag_x, mag_y, mag_z = self.bno.magnetic
+        mag_msg = MagneticField()
+        mag_msg.header.stamp = rospy.Time.now()
+        mag_msg.header.frame_id = "bno_imu_link"
+        mag_msg.magnetic_field.x = mag_x * 0.000001
+        mag_msg.magnetic_field.y = mag_y * 0.000001
+        mag_msg.magnetic_field.z = mag_z * 0.000001
+        mag_msg.magnetic_field_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        self.mag_pub.publish(mag_msg)
+
+        mag_ext_msg = magnetometer()
+        mag_ext_msg.x = mag_msg.magnetic_field.x
+        mag_ext_msg.y = mag_msg.magnetic_field.y
+        mag_ext_msg.z = mag_msg.magnetic_field.z
+        self.mag_ext_pub.publish(mag_ext_msg)
+
+
+    def publish_imu_heading(self):
+        acc_x, acc_y, acc_z = self.bno.acceleration
+        gyro_x, gyro_y, gyro_z = self.bno.gyro
+        orientation_x, orientation_y, orientation_z, orientation_w = self.bno.quaternion
+        imu_msg = Imu()
+        imu_msg.header.stamp = rospy.Time.now()
+        imu_msg.header.frame_id = "bno_imu_link"
+        imu_msg.orientation.x = orientation_x
+        imu_msg.orientation.y = orientation_y
+        imu_msg.orientation.z = orientation_z
+        imu_msg.orientation.w = orientation_w
+        imu_msg.orientation_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.angular_velocity.x = gyro_x
+        imu_msg.angular_velocity.y = gyro_y
+        imu_msg.angular_velocity.z = gyro_z
+        imu_msg.angular_velocity_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.linear_acceleration.x = acc_x
+        imu_msg.linear_acceleration.y = acc_y
+        imu_msg.linear_acceleration.z = acc_z
+        imu_msg.linear_acceleration_covariance = [1000.00, 0.0, 0.0, 0.0, 1000.00, 0.0, 0.0, 0.0, 1000.00]
+        if ((orientation_x + orientation_y + orientation_z + orientation_w) != 0.0):
+            self.nevheading_pub.publish(imu_msg)
+
+    def publish_diag(self):
+        diag_msg = DiagnosticArray()
+        diag_msg.header.stamp = rospy.Time.now()
+        diag_msg.status = []
+
+        mag_status, acc_status, gyro_status, game_status = node_bno085.bno.calibration_status
+
+        ############  DIAG MAGNETOMETER  ############
+        status = DiagnosticStatus()
+        status.name = "IMU BNO085: Magnetometer Calibration quality: "
+        status.hardware_id = "BNO085"
+        status.values = []
+        status_str = adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[mag_status]
+        status.values.append(KeyValue(key="State", value=status_str))
+        if mag_status == 0:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(mag_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[mag_status])
+        elif mag_status == 1:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(mag_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[mag_status])
+        elif mag_status == 2:
+            status.level = DiagnosticStatus.WARN
+            status.message = "({}) {}".format(mag_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[mag_status])
+        elif mag_status == 3:
+            status.level = DiagnosticStatus.OK
+            status.message = "({}) {}".format(mag_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[mag_status])
+        diag_msg.status.append(status)
+
+        ############  DIAG ACCELEROMETER  ############
+        status = DiagnosticStatus()
+        status.name = "IMU BNO085: Accelerometer Calibration quality: "
+        status.hardware_id = "BNO085"
+        status.values = []
+        status_str = adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[acc_status]
+        status.values.append(KeyValue(key="State", value=status_str))
+        if acc_status == 0:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(acc_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[acc_status])
+        elif acc_status == 1:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(acc_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[acc_status])
+        elif acc_status == 2:
+            status.level = DiagnosticStatus.WARN
+            status.message = "({}) {}".format(acc_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[acc_status])
+        elif acc_status == 3:
+            status.level = DiagnosticStatus.OK
+            status.message = "({}) {}".format(acc_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[acc_status])
+        diag_msg.status.append(status)
+
+        ############  DIAG GYRO  ############
+        status = DiagnosticStatus()
+        status.name = "IMU BNO085: Gyroscope Calibration quality: "
+        status.hardware_id = "BNO085"
+        status.values = []
+        status_str = adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[gyro_status]
+        status.values.append(KeyValue(key="State", value=status_str))
+        if gyro_status == 0:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(gyro_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[gyro_status])
+        elif gyro_status == 1:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(gyro_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[gyro_status])
+        elif gyro_status == 2:
+            status.level = DiagnosticStatus.WARN
+            status.message = "({}) {}".format(gyro_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[gyro_status])
+        elif gyro_status == 3:
+            status.level = DiagnosticStatus.OK
+            status.message = "({}) {}".format(gyro_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[gyro_status])
+        diag_msg.status.append(status)
+
+        ############  DIAG GAME VECTOR  ############
+        status = DiagnosticStatus()
+        status.name = "IMU BNO085: Game Rotation Vector Calibration quality: "
+        status.hardware_id = "BNO085"
+        status.values = []
+        status_str = adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[game_status]
+        status.values.append(KeyValue(key="State", value=status_str))
+        if game_status == 0:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(game_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[game_status])
+        elif game_status == 1:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "({}) {}".format(game_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[game_status])
+        elif game_status == 2:
+            status.level = DiagnosticStatus.WARN
+            status.message = "({}) {}".format(game_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[game_status])
+        elif game_status == 3:
+            status.level = DiagnosticStatus.OK
+            status.message = "({}) {}".format(game_status, adafruit_bno08xMOD.REPORT_ACCURACY_STATUS[game_status])
+        diag_msg.status.append(status)
+
+        self.diag_pub.publish(diag_msg)
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('bno085_node')
+        rospy.loginfo("<{}> Initialising bno085_node...".format(rospy.get_caller_id()))
+        node_bno085 = BNO085Node()
+        rate = 100
+        r = rospy.Rate(rate)  # 100Hz
+
+        def signal_handler(signum, frame):
+            node_bno085.uart.close()
+            rospy.signal_shutdown("end")
+            sys.exit(0)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        rospy.loginfo("<{}> Initialised.".format(rospy.get_caller_id()))
+        slow_counter = 0
+        slow_nr = rate  # 1x per second
+        slow_counter1 = 0
+        slow_nr1 = rate * 3  # 1x per 3 seconds
+        while not rospy.is_shutdown():
+            node_bno085.publish_mag()
+            node_bno085.publish_imu()
+            node_bno085.publish_imu_heading()
+            node_bno085.msg_bno085_status.status = True
+            if node_bno085.calibration_msg_received:
+                node_bno085.run_calibration()
+                node_bno085.calibration_msg_received = False
+            if (slow_nr == slow_counter):
+                node_bno085.publish_imu_status()
+                slow_counter = 0
+            slow_counter += 1
+            if (slow_nr1 == slow_counter1):
+                node_bno085.publish_diag()
+                slow_counter1 = 0
+            slow_counter1 += 1
+            r.sleep()
+
+    except rospy.ROSInterruptException:
+        rospy.loginfo(rospy.get_caller_id() + "  BNO085_node error.")

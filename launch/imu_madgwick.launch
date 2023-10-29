@@ -1,0 +1,22 @@
+<!-- Node for merging magnetometer and accelerometer data into a single imu message -->
+<launch>
+  #### Nodelet manager ######################################################
+
+  <node pkg="nodelet" type="nodelet" name="imu_manager"
+    args="manager" output="screen" />
+
+  #### IMU Driver ###########################################################
+
+  <node pkg="nodelet" type="nodelet" name="ImuFilterNodelet"
+    args="load imu_filter_madgwick/ImuFilterNodelet imu_manager"
+    output="screen">
+
+    <param name="publish_tf" value="false"/>
+    <param name="remove_gravity_vector" value="true"/>
+    <param name="use_mag" value="true"/>
+
+    <remap from="imu/data_raw" to="/bno085/imu" />
+    <remap from="imu/mag" to="/bno085/mag" />
+
+  </node>
+</launch>
