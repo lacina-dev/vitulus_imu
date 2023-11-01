@@ -12,14 +12,17 @@ import signal
 from bno085v2_node import adafruit_bno08xMOD
 from bno085v2_node.adafruit_bno08xMOD.uart import BNO08X_UART
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-
+import numpy as np
 
 class BNO085Node:
 
     def __init__(self):
         self.imu_pub = rospy.Publisher('bno085/imu', Imu, queue_size=10)
         self.nevheading_pub = rospy.Publisher('bno085/navheading', Imu, queue_size=10)
+        self.imu_calib_pub = rospy.Publisher('bno085/imu_calibrated', Imu, queue_size=10)
         self.mag_pub = rospy.Publisher('bno085/mag', MagneticField, queue_size=10)
+        self.mag_calib_pub = rospy.Publisher('bno085/mag_calibrated', MagneticField, queue_size=10)
+
 
         self.mag_ext_pub = rospy.Publisher('/imu/magnetometer', magnetometer, queue_size=10)
         self.acc_ext_pub = rospy.Publisher('/imu/accelerometer', accelerometer, queue_size=10)
@@ -53,6 +56,23 @@ class BNO085Node:
         # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_RAW_GYROSCOPE)
         # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_RAW_MAGNETOMETER)
         # self.bno.enable_feature(adafruit_bno08xMOD.BNO_REPORT_GYRO_INTEGRATED_ROTATION_VECTOR)
+
+        self.acc_calib_matrix = np.array([[1.001308, 0.000000, 0.000000, 0.038358],
+                                          [0.000000, 1.002202, 0.000000, -0.118057],
+                                          [0.000000, 0.000000, 0.999718, 0.075905],
+                                          [0.000000, 0.000000, 0.000000, 1.000000]])
+
+        self.mag_calib_matrix = np.array([[1.1240151351, 0.0167121353, -0.0796459402, -0.0000009471],
+                                          [0.0167121353, 1.1893352638, 0.0191496595, -0.0000027855],
+                                          [-0.0796459402, 0.0191496595, 1.1831411061, -0.0000010849],
+                                          [0.000000, 0.000000, 0.000000, 1.000000]])
+        # self.mag_calib_matrix = np.array(
+        #     [[1.1240151351 * 0.000001, 0.0167121353 * 0.000001, -0.0796459402 * 0.000001, -0.0000009471 * 0.000001],
+        #      [0.0167121353 * 0.000001, 1.1893352638 * 0.000001, 0.0191496595 * 0.000001, -0.0000027855 * 0.000001],
+        #      [-0.0796459402 * 0.000001, 0.0191496595 * 0.000001, 1.1831411061 * 0.000001, -0.0000010849 * 0.000001],
+        #      [0.000000, 0.000000, 0.000000, 1.000000]])
+
+        print(self.mag_calib_matrix)
 
     def callback_run_calibration(self, msg):
         self.calibration_msg = msg
@@ -105,6 +125,33 @@ class BNO085Node:
         imu_ext_msg.z = acc_z
         self.acc_ext_pub.publish(imu_ext_msg)
 
+    def publish_imu_calib(self):
+        acc_x, acc_y, acc_z = self.bno.acceleration
+        gyro_x, gyro_y, gyro_z = self.bno.gyro
+        uncalib_acc = np.array([acc_x, acc_y, acc_z, 1])
+        calib_acc = np.matmul(self.acc_calib_matrix, uncalib_acc)
+        # print(calib_acc)
+        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.quaternion
+        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.geomagnetic_quaternion
+        orientation_x, orientation_y, orientation_z, orientation_w = self.bno.game_quaternion
+        imu_msg = Imu()
+        imu_msg.header.stamp = rospy.Time.now()
+        imu_msg.header.frame_id = "bno_imu_link"
+        imu_msg.orientation.x = orientation_x
+        imu_msg.orientation.y = orientation_y
+        imu_msg.orientation.z = orientation_z
+        imu_msg.orientation.w = orientation_w
+        imu_msg.orientation_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.angular_velocity.x = gyro_x
+        imu_msg.angular_velocity.y = gyro_y
+        imu_msg.angular_velocity.z = gyro_z
+        imu_msg.angular_velocity_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.linear_acceleration.x = calib_acc[0]
+        imu_msg.linear_acceleration.y = calib_acc[1]
+        imu_msg.linear_acceleration.z = calib_acc[2]
+        imu_msg.linear_acceleration_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        if ((orientation_x + orientation_y + orientation_z + orientation_w) != 0.0):
+            self.imu_calib_pub.publish(imu_msg)
 
     def publish_mag(self):
         mag_x, mag_y, mag_z = self.bno.magnetic
@@ -117,10 +164,25 @@ class BNO085Node:
         mag_msg.magnetic_field_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
         self.mag_pub.publish(mag_msg)
 
+    def publish_mag_calib(self):
+        mag_x, mag_y, mag_z = self.bno.magnetic
+        uncalib_mag = np.array([mag_x, mag_y, mag_z, 1])
+        calib_acc = np.matmul(self.mag_calib_matrix, uncalib_mag)
+        mag_msg = MagneticField()
+        mag_msg.header.stamp = rospy.Time.now()
+        mag_msg.header.frame_id = "bno_imu_link"
+        mag_msg.magnetic_field.x = calib_acc[0] * 0.000001
+        mag_msg.magnetic_field.y = calib_acc[1] * 0.000001
+        mag_msg.magnetic_field.z = calib_acc[2] * 0.000001
+        mag_msg.magnetic_field_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        self.mag_calib_pub.publish(mag_msg)
+
+    def publish_mag_ext(self):
+        mag_x, mag_y, mag_z = self.bno.magnetic
         mag_ext_msg = magnetometer()
-        mag_ext_msg.x = mag_msg.magnetic_field.x
-        mag_ext_msg.y = mag_msg.magnetic_field.y
-        mag_ext_msg.z = mag_msg.magnetic_field.z
+        mag_ext_msg.x = mag_x * 0.000001
+        mag_ext_msg.y = mag_y * 0.000001
+        mag_ext_msg.z = mag_z * 0.000001
         self.mag_ext_pub.publish(mag_ext_msg)
 
 
@@ -251,7 +313,7 @@ if __name__ == '__main__':
         def signal_handler(signum, frame):
             node_bno085.uart.close()
             rospy.signal_shutdown("end")
-            sys.exit(0)
+            # sys.exit(0)
         signal.signal(signal.SIGINT, signal_handler)
 
         rospy.loginfo("<{}> Initialised.".format(rospy.get_caller_id()))
@@ -261,7 +323,9 @@ if __name__ == '__main__':
         slow_nr1 = rate * 3  # 1x per 3 seconds
         while not rospy.is_shutdown():
             node_bno085.publish_mag()
+            node_bno085.publish_mag_calib()
             node_bno085.publish_imu()
+            node_bno085.publish_imu_calib()
             node_bno085.publish_imu_heading()
             node_bno085.msg_bno085_status.status = True
             if node_bno085.calibration_msg_received:
@@ -269,6 +333,7 @@ if __name__ == '__main__':
                 node_bno085.calibration_msg_received = False
             if (slow_nr == slow_counter):
                 node_bno085.publish_imu_status()
+                node_bno085.publish_mag_ext()
                 slow_counter = 0
             slow_counter += 1
             if (slow_nr1 == slow_counter1):

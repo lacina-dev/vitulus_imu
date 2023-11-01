@@ -1,5 +1,8 @@
 <!-- Node for merging magnetometer and accelerometer data into a single imu message -->
 <launch>
+
+
+
   #### Nodelet manager ######################################################
 
   <node pkg="nodelet" type="nodelet" name="imu_manager"
@@ -15,8 +18,35 @@
     <param name="remove_gravity_vector" value="true"/>
     <param name="use_mag" value="true"/>
 
-    <remap from="imu/data_raw" to="/bno085/imu" />
-    <remap from="imu/mag" to="/bno085/mag" />
+    <remap from="imu/data_raw" to="/bno085/imu_calibrated" />
+    <remap from="imu/mag" to="/bno085/mag_calibrated" />
 
   </node>
+
+  <node pkg="imu_complementary_filter" type="complementary_filter_node"
+              name="complementary_filter_gain_node_imu" output="screen">
+          <param name="do_bias_estimation" value="true"/>
+          <param name="do_adaptive_gain" value="true"/>
+          <param name="use_mag" value="true"/>
+          <param name="gain_acc" value="0.1"/>
+          <param name="gain_mag" value="0.01"/>
+          <param name="publish_tf" value="false"/>
+          <param name="publish_debug_topics" value="false"/>
+          <remap from="imu/data_raw" to="/bno085/imu" />
+          <remap from="imu/mag" to="/bno085/mag" />
+<!--          <remap from="imu/data_raw" to="/bno085/imu" />-->
+<!--          <remap from="imu/mag" to="/bno085/mag" />-->
+
+          <remap from="imu/data" to="imu/nwu/imu_compl" />
+        </node>
+
+
+
+    #### NWU to ENU ###########################################################
+    <node pkg="vitulus_imu" type="nwu_to_enu" name="nwu_to_enu"
+    args="" output="screen">
+            <remap from="nwu1_in" to="imu/nwu/imu_compl" />
+            <remap from="enu1_out" to="/imu/complementary" />
+    </node>
+
 </launch>

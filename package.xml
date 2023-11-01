@@ -16,4 +16,6 @@
   <exec_depend>rosserial_python</exec_depend>
   <exec_depend>message_runtime</exec_depend>
   <build_depend>message_generation</build_depend>
+<!--  <build_depend>cmake_modules</build_depend>-->
+<!--  <exec_depend>cmake_modules</exec_depend>-->
 </package>
