@@ -1,9 +1,11 @@
 #!/usr/bin/env python
+import time
+
 import rospy
 from sensor_msgs.msg import MagneticField, Imu
 from sensor_msgs_ext.msg import magnetometer, accelerometer
 from vitulus_msgs.msg import Imu_status
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32MultiArray
 import sys
 import serial
 import signal
@@ -33,13 +35,15 @@ class BNO085Node:
         self.acc_ext_pub = rospy.Publisher('/imu/accelerometer', accelerometer, queue_size=10)
         self.sub_run_calibration = rospy.Subscriber("bno085/run_calibration", Bool, self.callback_run_calibration)
         self.sub_reset_calibration = rospy.Subscriber("bno085/reset_calibration", Bool, self.callback_reset_calibration)
+        self.sub_restart = rospy.Subscriber("bno085/restart", Bool, self.callback_restart)
         self.calibration_msg = Bool(True)
         self.calibration_msg_received = False
 
         self.marker_imu = Marker()
         self.marker_mag = Marker()
         self.marker_nav = Marker()
-        self.marker_pub = rospy.Publisher("/imu/markers", MarkerArray, queue_size=0)
+        self.marker_pub = rospy.Publisher("/imu/markers", MarkerArray, queue_size=1)
+        self.yaws_pub = rospy.Publisher("/imu/yaws", Float32MultiArray, queue_size=1)
 
         rospy.loginfo("<{}> Connecting UART /dev/imu, baudrate 3000000...".format(rospy.get_caller_id()))
         self.uart = serial.Serial("/dev/imu", baudrate=3000000)
@@ -96,18 +100,36 @@ class BNO085Node:
         self.magnetic_yaw = 0
         self.arvr_yaw = 0
 
+    def publish_yaws(self):
+        yaws = Float32MultiArray()
+        yaw_mag = round(self.magnetic_yaw * 180.0 / math.pi, 2)
+        yaw_arvr = round(self.arvr_yaw * 180.0 / math.pi, 2)
+        yaw_navheading = round(self.navheading_yaw * 180.0 / math.pi, 2)
+        yaw_imu = round(self.imu_yaw * 180.0 / math.pi, 2)
+        yaws.data = [yaw_imu, yaw_navheading, yaw_mag, yaw_arvr]
+        self.yaws_pub.publish(yaws)
 
     def callback_reset_calibration(self, msg):
         if msg.data:
+            print(self.bno)
             self.bno.set_dcd_reset()
             self.bno.delete_frs_dcd()
             self.bno.set_dcd_reset()
             # self.bno.get_frs_dcd()
-            rospy.logwarn("<{}> Calibration reset.".format(rospy.get_caller_id()))
+            rospy.logwarn("<{}> Calibration DCD removed.".format(rospy.get_caller_id()))
+            self.callback_restart(Bool(True))
+
 
     def callback_run_calibration(self, msg):
         self.calibration_msg = msg
         self.calibration_msg_received = True
+
+    def callback_restart(self, msg):
+        if msg.data:
+            rospy.logwarn("<{}> IMU restarting.".format(rospy.get_caller_id()))
+            rospy.signal_shutdown("Restarting IMU")
+
+
 
     def run_calibration(self):
         if self.calibration_msg.data:
@@ -169,7 +191,7 @@ class BNO085Node:
             color = [0.0, 1.0, 0.0, 1.0]
             scale = [1.6, 0.6, 0.9]
             self.marker_imu = self.get_marker(orientation_x, orientation_y, orientation_z, orientation_w,
-                                              color, scale, z_offset=-0.45, id=2, ns="IMU")
+                                              color, scale, z_offset=0.0, id=2, ns="IMU")
 
         imu_ext_msg = accelerometer()
         imu_ext_msg.x = acc_x
@@ -268,7 +290,7 @@ class BNO085Node:
             color = [0.0, 0.0, 1.0, 1.0]
             scale = [1.8, 0.8, 0.6]
             self.marker_nav = self.get_marker(orientation_x, orientation_y, orientation_z, orientation_w,
-                                              color, scale, z_offset=-0.3, id=1, ns="NAV")
+                                              color, scale, z_offset=0.0, id=1, ns="NAV")
 
         (roll, pitch, yaw) = euler_from_quaternion([orientation_x, orientation_y, orientation_z, orientation_w])
         self.navheading_yaw = yaw
@@ -326,7 +348,7 @@ class BNO085Node:
             color = [1.0, 0.0, 0.0, 1.0]
             scale = [2.0, 1.0, 0.3]
             self.marker_mag = self.get_marker(orientation_x, orientation_y, orientation_z, orientation_w,
-                                              color, scale, z_offset=-0.15, id=0, ns="MAG")
+                                              color, scale, z_offset=0.0, id=0, ns="MAG")
 
         (roll, pitch, yaw) = euler_from_quaternion([orientation_x, orientation_y, orientation_z, orientation_w])
         self.magnetic_yaw = yaw
@@ -571,7 +593,6 @@ class BNO085Node:
         return marker
 
     def publish_markers(self):
-        # print("publishing markers")
         m_array = MarkerArray()
         m_array.markers.append(self.marker_imu)
         m_array.markers.append(self.marker_nav)
@@ -615,7 +636,7 @@ if __name__ == '__main__':
                 node_bno085.publish_imu_status()
                 node_bno085.publish_mag_ext()
                 # node_bno085.print_imu_quat_offset()
-                node_bno085.print_yaw()
+                # node_bno085.print_yaw()
                 slow_counter = 0
             slow_counter += 1
             if (slow_nr1 == slow_counter1):
@@ -624,6 +645,7 @@ if __name__ == '__main__':
             slow_counter1 += 1
             if (slow_nr2 == slow_counter2):
                 node_bno085.publish_markers()
+                node_bno085.publish_yaws()
                 slow_counter2 = 0
             slow_counter2 += 1
             r.sleep()
