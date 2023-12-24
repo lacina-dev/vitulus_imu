@@ -84,17 +84,7 @@ class BNO085Node:
                                           [0.0167121353, 1.1893352638, 0.0191496595, -0.0000027855],
                                           [-0.0796459402, 0.0191496595, 1.1831411061, -0.0000010849],
                                           [0.000000, 0.000000, 0.000000, 1.000000]])
-        # self.mag_calib_matrix = np.array(
-        #     [[1.1240151351 * 0.000001, 0.0167121353 * 0.000001, -0.0796459402 * 0.000001, -0.0000009471 * 0.000001],
-        #      [0.0167121353 * 0.000001, 1.1893352638 * 0.000001, 0.0191496595 * 0.000001, -0.0000027855 * 0.000001],
-        #      [-0.0796459402 * 0.000001, 0.0191496595 * 0.000001, 1.1831411061 * 0.000001, -0.0000010849 * 0.000001],
-        #      [0.000000, 0.000000, 0.000000, 1.000000]])
 
-        # print(self.mag_calib_matrix)
-        # self.bno.begin_calibration()
-        # rospy.logwarn("<{}> Calibration started.".format(rospy.get_caller_id()))
-
-        # self.bno.set_periodic_save_calibration_data()
         self.imu_yaw = 0
         self.navheading_yaw = 0
         self.magnetic_yaw = 0
@@ -128,8 +118,6 @@ class BNO085Node:
         if msg.data:
             rospy.logwarn("<{}> IMU restarting.".format(rospy.get_caller_id()))
             rospy.signal_shutdown("Restarting IMU")
-
-
 
     def run_calibration(self):
         if self.calibration_msg.data:
@@ -167,8 +155,6 @@ class BNO085Node:
     def publish_imu(self):
         acc_x, acc_y, acc_z = self.bno.acceleration
         gyro_x, gyro_y, gyro_z = self.bno.gyro
-        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.quaternion
-        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.geomagnetic_quaternion
         orientation_x, orientation_y, orientation_z, orientation_w = self.bno.game_quaternion
         imu_msg = Imu()
         imu_msg.header.stamp = rospy.Time.now()
@@ -207,9 +193,6 @@ class BNO085Node:
         gyro_x, gyro_y, gyro_z = self.bno.gyro
         uncalib_acc = np.array([acc_x, acc_y, acc_z, 1])
         calib_acc = np.matmul(self.acc_calib_matrix, uncalib_acc)
-        # print(calib_acc)
-        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.quaternion
-        # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.geomagnetic_quaternion
         orientation_x, orientation_y, orientation_z, orientation_w = self.bno.game_quaternion
         imu_msg = Imu()
         imu_msg.header.stamp = rospy.Time.now()
