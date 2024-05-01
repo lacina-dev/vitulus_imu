@@ -59,11 +59,13 @@ class BNO085Node:
         imu_msg.orientation.y = orientation_y
         imu_msg.orientation.z = orientation_z
         imu_msg.orientation.w = orientation_w
-        imu_msg.orientation_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        # imu_msg.orientation_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.orientation_covariance = [0.00000025, 0.0, 0.0, 0.0, 0.00000025, 0.0, 0.0, 0.0, 0.00000025]
         imu_msg.angular_velocity.x = gyro_x
         imu_msg.angular_velocity.y = gyro_y
         imu_msg.angular_velocity.z = gyro_z
-        imu_msg.angular_velocity_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        # imu_msg.angular_velocity_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        imu_msg.angular_velocity_covariance = [0.00000025, 0.0, 0.0, 0.0, 0.00000025, 0.0, 0.0, 0.0, 0.00000025]
         imu_msg.linear_acceleration.x = acc_x
         imu_msg.linear_acceleration.y = acc_y
         imu_msg.linear_acceleration.z = acc_z
