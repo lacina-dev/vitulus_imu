@@ -5,7 +5,7 @@
   <description>IMU for Vitulus robot. BNO085 over USB to serial.</description>
 
   <maintainer email="robert@lacina.dev">Robert Lacina</maintainer>
-  <license>Apache 2.0</license>
+  <license>MIT</license>
   <author email="robert@lacina.dev">Robert Lacina</author>
 
 
