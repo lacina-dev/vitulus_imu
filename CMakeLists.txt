@@ -51,7 +51,7 @@ include_directories(
 # Install
 ################################################################################
 
-install(DIRECTORY launch config rviz
+install(DIRECTORY launch rviz
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
