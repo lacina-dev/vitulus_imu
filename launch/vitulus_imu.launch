@@ -3,7 +3,7 @@
 
 <!--    #### BNO085Node publish imu and mag messages #####-->
     <node name="bno085_node" pkg="vitulus_imu" type="bno085_node" respawn="true"
-          respawn_delay="1" output="screen"/>
+          respawn_delay="1" output="log"/>
 
 
 <!--##### Show in Rviz #####-->
