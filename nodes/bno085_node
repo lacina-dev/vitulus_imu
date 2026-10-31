@@ -1,50 +1,421 @@
 #!/usr/bin/env python
+"""BNO085 over UART: publishes /bno085/imu, /navheading, /mag, and watches itself.
+
+The sensor is opened through adafruit_bno08x, whose UART code reads for ever when
+the port has no timeout and loops for ever in soft_reset() when the sensor does
+not answer.  This node therefore:
+
+  * opens the port with a read timeout and flushes it (GuardedUart);
+  * bounds the reset handshake, repeats the request, tolerates a broken first
+    frame (BoundedBNO); two attempts with a reopen, then a non-zero exit so
+    that the roslaunch respawn starts over;
+  * survives a damaged frame at runtime without resetting the sensor: a reset
+    restarts the game rotation vector, so yaw jumps;
+  * stops publishing frozen values when packets stop, and exits after
+    ~stall_timeout_s;
+  * has a daemon thread (Supervisor) that ends the process with os._exit when
+    the main thread is stuck or does not obey a shutdown.
+
+Consecutive failures live in ~failures (parameter server, survives the respawn):
+pause before a new try 0, 1, 2, 4 ... ~backoff_max_s seconds.  From
+~max_failures the state reads `failed`, tries go on at the slowest pace.
+
+  out bno085/imu_status  vitulus_msgs/Imu_status, 1 Hz, also during startup;
+                         status true only while fresh packets arrive
+      bno085/health      std_msgs/String JSON, latched, 1 Hz:
+                         state backoff|connecting|ok|stalled|failed
+                         reason, failures, attempt, packet_age_s, frame_errors,
+                         sensor_reset_t (wall time of the last sensor reset: a
+                         new value means a new yaw origin), pid
+  exit 0 shutdown, 1 connect failed, 2 packets stopped, 3 port lost, 4 hard exit
+"""
+import json
+import logging
+import os
+import sys
+import threading
+import time
+
 import rospy
 from sensor_msgs.msg import MagneticField, Imu
+from std_msgs.msg import String
 from vitulus_msgs.msg import Imu_status
-import sys
 import serial
-import signal
 import adafruit_bno08x
+from adafruit_bno08x import PacketError, _separate_batch
 from adafruit_bno08x.uart import BNO08X_UART
+
+CHANNEL_SHTP_COMMAND = 0
+CHANNEL_EXE = 1
+CHANNEL_SENSOR_REPORTS = 3
+EXIT_OK, EXIT_CONNECT, EXIT_STALL, EXIT_PORT, EXIT_HARD = 0, 1, 2, 3, 4
+SHTP_ADVERTISE_RESEND_S = 1.0
+
+
+class UartSilent(Exception):
+    """Nothing arrived within the read timeout."""
+
+
+class ShutdownRequested(Exception):
+    """rospy is shutting down while we wait for the sensor."""
+
+
+class ImuInitError(Exception):
+    """The sensor did not complete the reset handshake."""
+
+
+class GuardedUart(object):
+    """A serial port for the library: read() returns data or raises, never blocks
+    for long.  The library's own loop `if not data: continue` would otherwise spin
+    for ever on a silent port."""
+
+    def __init__(self, port, baudrate, read_timeout, should_stop):
+        self.should_stop = should_stop
+        self.ser = serial.Serial(port, baudrate=baudrate, timeout=read_timeout,
+                                 write_timeout=read_timeout, exclusive=True)
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+
+    def read(self, size=1):
+        data = self.ser.read(size)
+        if not data:
+            if self.should_stop():
+                raise ShutdownRequested()
+            raise UartSilent()
+        return data
+
+    def write(self, data):
+        return self.ser.write(data)
+
+    @property
+    def in_waiting(self):
+        return self.ser.in_waiting
+
+    def close(self):
+        try:
+            self.ser.close()
+        except (serial.SerialException, OSError):
+            pass
+
+
+class BoundedBNO(BNO08X_UART):
+    """BNO08X_UART with a time limit on everything in initialize()."""
+
+    def __init__(self, uart, advert_timeout, should_stop):
+        self.advert_timeout = advert_timeout
+        self.should_stop = should_stop
+        self.last_report_t = None
+        self.frame_errors = 0
+        super().__init__(uart, reset=None, debug=False)
+
+    def initialize(self):
+        # One try only: the caller reopens the port between tries.
+        self.soft_reset()
+        self._check_id()
+
+    def soft_reset(self):
+        deadline = time.monotonic() + self.advert_timeout
+        resend_t = 0.0
+        while True:
+            if self.should_stop():
+                raise ShutdownRequested()
+            now = time.monotonic()
+            if now >= deadline:
+                raise ImuInitError('no SHTP answer in %.1f s' % self.advert_timeout)
+            if now >= resend_t:
+                self._send_packet(CHANNEL_SHTP_COMMAND, bytearray([0, 1]))
+                resend_t = time.monotonic() + SHTP_ADVERTISE_RESEND_S
+                time.sleep(0.5)
+            try:
+                packet = self._read_packet()
+            except UartSilent:
+                continue
+            except (RuntimeError, PacketError, IndexError):
+                # We joined the stream in the middle of a frame.
+                self.frame_errors += 1
+                continue
+            if packet.channel_number == CHANNEL_SHTP_COMMAND:
+                break
+        self._send_packet(CHANNEL_EXE, bytearray([1]))
+        time.sleep(0.5)
+        self._send_packet(CHANNEL_EXE, bytearray([1]))
+        time.sleep(0.5)
+
+    def _read_packet(self):
+        packet = super()._read_packet()
+        if packet.channel_number == CHANNEL_SENSOR_REPORTS:
+            self.last_report_t = time.monotonic()
+        return packet
+
+    def _handle_packet(self, packet):
+        # As the library, without print(packet) on each damaged packet.
+        try:
+            _separate_batch(packet, self._packet_slices)
+            while self._packet_slices:
+                self._process_report(*self._packet_slices.pop())
+        finally:
+            del self._packet_slices[:]
+
+    def poll(self):
+        self._process_available_packets(max_packets=200)
+
+    def report_age(self):
+        if self.last_report_t is None:
+            return None
+        return time.monotonic() - self.last_report_t
+
+
+class Supervisor(threading.Thread):
+    """Ends the process when the main thread cannot.  on_tick runs about 1x/s."""
+
+    PERIOD_S = 0.2
+
+    def __init__(self, is_shutdown, on_tick, log, shutdown_grace_s=2.0):
+        super().__init__(name='bno085_supervisor', daemon=True)
+        self.is_shutdown = is_shutdown
+        self.on_tick = on_tick
+        self.log = log
+        self.shutdown_grace_s = shutdown_grace_s
+        self.beat_t = time.monotonic()
+        self.limit_s = 60.0
+        self.exit_t = None
+        self.exit_code = EXIT_OK
+
+    def beat(self, limit_s):
+        self.limit_s = limit_s
+        self.beat_t = time.monotonic()
+
+    def leave_within(self, seconds, code):
+        self.exit_code = code
+        self.exit_t = time.monotonic() + seconds
+
+    def hard_exit(self, code, why):
+        self.log(why)
+        logging.shutdown()
+        os._exit(code)
+
+    def run(self):
+        last = time.monotonic()
+        tick_t = 0.0
+        while True:
+            time.sleep(self.PERIOD_S)
+            now = time.monotonic()
+            # We stalled too (memory pressure, CPU): the main thread gets a new
+            # chance, otherwise a machine hiccup would reset the sensor.
+            if now - last > 1.0:
+                self.beat_t += now - last
+            last = now
+            if self.exit_t is None and self.is_shutdown():
+                self.leave_within(self.shutdown_grace_s, EXIT_OK)
+            if self.exit_t is not None:
+                if now >= self.exit_t:
+                    self.hard_exit(self.exit_code, 'bno085_node: forced exit %d' % self.exit_code)
+            elif now - self.beat_t > self.limit_s:
+                self.hard_exit(EXIT_HARD, 'bno085_node: main thread stuck for %.0f s, hard exit'
+                               % (now - self.beat_t))
+            if now - tick_t >= 1.0:
+                tick_t = now
+                try:
+                    self.on_tick()
+                except Exception:  # noqa: BLE001 - must never stop the watchdog
+                    pass
 
 
 class BNO085Node:
 
     def __init__(self):
+        self.port = rospy.get_param('~port', '/dev/imu')
+        self.baud = rospy.get_param('~baud', 3000000)
+        self.read_timeout_s = rospy.get_param('~read_timeout_s', 0.2)
+        self.advert_timeout_s = rospy.get_param('~advert_timeout_s', 3.0)
+        self.connect_attempts = rospy.get_param('~connect_attempts', 2)
+        self.init_limit_s = rospy.get_param('~init_limit_s', 40.0)
+        self.run_limit_s = rospy.get_param('~run_limit_s', 5.0)
+        self.stale_s = rospy.get_param('~stale_s', 0.5)
+        self.stall_timeout_s = rospy.get_param('~stall_timeout_s', 2.0)
+        self.stable_s = rospy.get_param('~stable_s', 10.0)
+        self.backoff_max_s = rospy.get_param('~backoff_max_s', 30.0)
+        self.max_failures = rospy.get_param('~max_failures', 8)
+        self.failures = rospy.get_param('~failures', 0)
+
         self.imu_pub = rospy.Publisher('bno085/imu', Imu, queue_size=10)
         self.nevheading_pub = rospy.Publisher('bno085/navheading', Imu, queue_size=10)
         self.mag_pub = rospy.Publisher('bno085/mag', MagneticField, queue_size=10)
-        rospy.loginfo("<{}> Connecting UART /dev/imu, baudrate 3000000...".format(rospy.get_caller_id()))
-        self.uart = serial.Serial("/dev/imu", baudrate=3000000)
-        self.bno = BNO08X_UART(self.uart, debug=False)
-        rospy.loginfo("<{}> UART connected.".format(rospy.get_caller_id()))
-
         self.imu_status_pub = rospy.Publisher('bno085/imu_status', Imu_status, queue_size=10)
+        self.health_pub = rospy.Publisher('bno085/health', String, queue_size=1, latch=True)
         self.msg_bno085_status = Imu_status()
         self.msg_bno085_status.status = False
-        self.msg_bno085_status.header.stamp = rospy.Time.now()
 
+        self.uart = None
+        self.bno = None
+        self.state = 'connecting'
+        self.reason = ''
+        self.attempt = 0
+        self.sensor_reset_t = 0.0
+        self.supervisor = Supervisor(rospy.is_shutdown, self.publish_status, self.log_hard)
+        self.supervisor.start()
 
-        self.bno.enable_feature(adafruit_bno08x.BNO_REPORT_ACCELEROMETER)
-        self.bno.enable_feature(adafruit_bno08x.BNO_REPORT_GYROSCOPE)
-        self.bno.enable_feature(adafruit_bno08x.BNO_REPORT_MAGNETOMETER)
-        self.bno.enable_feature(adafruit_bno08x.BNO_REPORT_ROTATION_VECTOR)
-        self.bno.enable_feature(adafruit_bno08x.BNO_REPORT_LINEAR_ACCELERATION)
-        self.bno.enable_feature(adafruit_bno08x.BNO_REPORT_GEOMAGNETIC_ROTATION_VECTOR)
-        self.bno.enable_feature(adafruit_bno08x.BNO_REPORT_GAME_ROTATION_VECTOR)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_STEP_COUNTER)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_STABILITY_CLASSIFIER)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_ACTIVITY_CLASSIFIER)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_SHAKE_DETECTOR)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_RAW_ACCELEROMETER)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_RAW_GYROSCOPE)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_RAW_MAGNETOMETER)
-        # bno.enable_feature(adafruit_bno08x.BNO_REPORT_GYRO_INTEGRATED_ROTATION_VECTOR)
+    @staticmethod
+    def log_hard(text):
+        rospy.logerr(text)
 
-    def publish_imu_status(self):
+    def backoff_s(self):
+        if self.failures <= 1:
+            return 0.0
+        return min(2.0 ** (self.failures - 2), self.backoff_max_s)
+
+    def set_state(self, state, reason=''):
+        self.state, self.reason = state, reason
+        self.publish_status()
+
+    def publish_status(self):
+        age = self.bno.report_age() if self.bno is not None else None
+        fresh = self.state == 'ok' and age is not None and age <= self.stale_s
+        self.msg_bno085_status.status = fresh
         self.msg_bno085_status.header.stamp = rospy.Time.now()
         self.imu_status_pub.publish(self.msg_bno085_status)
+        self.health_pub.publish(String(json.dumps({
+            'state': self.state, 'reason': self.reason, 'ok': fresh,
+            'failures': self.failures, 'attempt': self.attempt,
+            'packet_age_s': None if age is None else round(age, 2),
+            'frame_errors': self.bno.frame_errors if self.bno is not None else 0,
+            'sensor_reset_t': self.sensor_reset_t, 'pid': os.getpid()})))
+
+    def wait(self, seconds):
+        """A pause that a shutdown ends at once."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not rospy.is_shutdown():
+            self.supervisor.beat(self.init_limit_s)
+            time.sleep(0.1)
+
+    def close_uart(self):
+        if self.uart is not None:
+            self.uart.close()
+            self.uart = None
+
+    def connect_once(self):
+        rospy.loginfo("<{}> Connecting UART {}, baudrate {}...".format(
+            rospy.get_caller_id(), self.port, self.baud))
+        self.uart = GuardedUart(self.port, self.baud, self.read_timeout_s, rospy.is_shutdown)
+        self.bno = BoundedBNO(self.uart, self.advert_timeout_s, rospy.is_shutdown)
+        for feature in (adafruit_bno08x.BNO_REPORT_ACCELEROMETER,
+                        adafruit_bno08x.BNO_REPORT_GYROSCOPE,
+                        adafruit_bno08x.BNO_REPORT_MAGNETOMETER,
+                        adafruit_bno08x.BNO_REPORT_ROTATION_VECTOR,
+                        adafruit_bno08x.BNO_REPORT_LINEAR_ACCELERATION,
+                        adafruit_bno08x.BNO_REPORT_GEOMAGNETIC_ROTATION_VECTOR,
+                        adafruit_bno08x.BNO_REPORT_GAME_ROTATION_VECTOR):
+            self.bno.enable_feature(feature)
+            self.supervisor.beat(self.init_limit_s)
+        self.sensor_reset_t = time.time()
+        rospy.loginfo("<{}> UART connected.".format(rospy.get_caller_id()))
+
+    def connect(self):
+        """True when the sensor streams; False after the tries or at a shutdown."""
+        pause = self.backoff_s()
+        if pause > 0:
+            state = 'failed' if self.failures >= self.max_failures else 'backoff'
+            self.set_state(state, 'waiting %.0f s, %d failures' % (pause, self.failures))
+            self.wait(pause)
+        for self.attempt in range(1, self.connect_attempts + 1):
+            if rospy.is_shutdown():
+                return False
+            self.set_state('connecting')
+            self.supervisor.beat(self.init_limit_s)
+            try:
+                self.connect_once()
+                self.set_state('ok')
+                return True
+            except ShutdownRequested:
+                return False
+            except (ImuInitError, UartSilent, RuntimeError, PacketError, IndexError,
+                    serial.SerialException, OSError) as exc:
+                self.reason = '{}: {}'.format(type(exc).__name__, exc)
+                rospy.logwarn("<{}> connect try {}/{} failed: {}".format(
+                    rospy.get_caller_id(), self.attempt, self.connect_attempts, self.reason))
+            self.bno = None
+            self.close_uart()
+            self.wait(0.3)
+        return False
+
+    def note_failure(self, state, reason):
+        self.failures += 1
+        try:
+            rospy.set_param('~failures', self.failures)
+        except Exception:  # noqa: BLE001 - only the pause gets shorter
+            pass
+        if self.failures >= self.max_failures:
+            state = 'failed'
+        if self.failures == self.max_failures:
+            rospy.logerr("<{}> IMU failed {} times in a row: {}".format(
+                rospy.get_caller_id(), self.failures, reason))
+        else:
+            rospy.logwarn("<{}> IMU {}: {} (failure {})".format(
+                rospy.get_caller_id(), state, reason, self.failures))
+        self.set_state(state, reason)
+
+    def clear_failures(self):
+        self.failures = 0
+        try:
+            rospy.set_param('~failures', 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def spin(self):
+        """Returns the exit code."""
+        rate = 100
+        r = rospy.Rate(rate)  # 100Hz
+        rospy.loginfo("<{}> Initialised.".format(rospy.get_caller_id()))
+        started = time.monotonic()
+        last_errors = 0
+        while not rospy.is_shutdown():
+            self.supervisor.beat(self.run_limit_s)
+            try:
+                self.bno.poll()
+                age = self.bno.report_age()
+                if age is not None and age <= self.stale_s:
+                    self.publish_mag()
+                    self.publish_imu()
+                    self.publish_imu_heading()
+            except (serial.SerialException, OSError) as exc:
+                self.note_failure('stalled', 'port lost: {}'.format(exc))
+                return EXIT_PORT
+            except rospy.ROSException:
+                if rospy.is_shutdown():
+                    break
+            except Exception:  # noqa: BLE001 - damaged frame: resync, keep the yaw origin
+                self.bno.frame_errors += 1
+
+            age = self.bno.report_age()
+            if age is None:
+                age = time.monotonic() - started
+            if age > self.stall_timeout_s:
+                self.note_failure('stalled', 'no sensor packets for %.1f s' % age)
+                return EXIT_STALL
+            if self.failures and time.monotonic() - started > self.stable_s:
+                self.clear_failures()
+            if self.bno.frame_errors != last_errors:
+                last_errors = self.bno.frame_errors
+                rospy.logwarn_throttle(30.0, "<{}> {} damaged frames so far, resynced".format(
+                    rospy.get_caller_id(), last_errors))
+            try:
+                r.sleep()
+            except rospy.ROSTimeMovedBackwardsException:
+                pass
+            except rospy.ROSInterruptException:
+                break
+        return EXIT_OK
+
+    def run(self):
+        code = EXIT_OK
+        if self.connect():
+            code = self.spin()
+        elif not rospy.is_shutdown():
+            self.note_failure('connecting', self.reason or 'no sensor')
+            code = EXIT_CONNECT
+        self.supervisor.leave_within(2.0, code)
+        self.close_uart()
+        return code
 
     def publish_imu(self):
         acc_x, acc_y, acc_z = self.bno.acceleration
@@ -105,34 +476,7 @@ class BNO085Node:
         if ((orientation_x + orientation_y + orientation_z + orientation_w) != 0.0):
             self.nevheading_pub.publish(imu_msg)
 
-
 if __name__ == '__main__':
-    try:
-        rospy.init_node('bno085_node')
-        rospy.loginfo("<{}> Initialising bno085_node...".format(rospy.get_caller_id()))
-        node_bno085 = BNO085Node()
-        rate = 100
-        r = rospy.Rate(rate)  # 100Hz
-
-        def signal_handler(signum, frame):
-            node_bno085.uart.close()
-            rospy.signal_shutdown("end")
-            sys.exit(0)
-        signal.signal(signal.SIGINT, signal_handler)
-
-        rospy.loginfo("<{}> Initialised.".format(rospy.get_caller_id()))
-        slow_counter = 0
-        slow_nr = rate  # 1x per second
-        while not rospy.is_shutdown():
-            node_bno085.publish_mag()
-            node_bno085.publish_imu()
-            node_bno085.publish_imu_heading()
-            node_bno085.msg_bno085_status.status = True
-            if (slow_nr == slow_counter):
-                node_bno085.publish_imu_status()
-                slow_counter = 0
-            slow_counter += 1
-            r.sleep()
-
-    except rospy.ROSInterruptException:
-        rospy.loginfo(rospy.get_caller_id() + "  BNO085_node error.")
+    rospy.init_node('bno085_node')
+    rospy.loginfo("<{}> Initialising bno085_node...".format(rospy.get_caller_id()))
+    sys.exit(BNO085Node().run())
