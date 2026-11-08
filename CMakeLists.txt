@@ -58,6 +58,8 @@ install(DIRECTORY launch rviz
 catkin_install_python(PROGRAMS
   nodes/bno085_node
   nodes/bno085v2_node
+  nodes/mag_heading
+  tools/mag_replay.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

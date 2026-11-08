@@ -5,6 +5,19 @@
     <node name="bno085_node" pkg="vitulus_imu" type="bno085_node" respawn="true"
           respawn_delay="1" output="log"/>
 
+<!--    #### Heading from the magnetometer (published and compared with RTK; navigation does not use it) #####-->
+    <node name="mag_heading" pkg="vitulus_imu" type="mag_heading" respawn="true"
+          respawn_delay="30" output="log">
+        <param name="mag_topic" value="/bno085/mag_uncal"/>
+        <param name="mag_source" value="uncal"/>
+        <param name="imu_topic" value="/bno085/imu"/>
+        <param name="rtk_topic" value="/gnss_heading/navheading"/>
+        <param name="rtk_cov_max" value="0.01"/>
+        <param name="calibration_file" value="$(env HOME)/.ros/vitulus_imu/mag_calibration.yaml"/>
+        <param name="self_calibrate" value="true"/>
+        <param name="fit_interval_s" value="45.0"/>
+    </node>
+
 
 <!--##### Show in Rviz #####-->
 <!--    <node name="rviz"-->

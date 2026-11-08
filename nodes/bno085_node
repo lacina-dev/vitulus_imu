@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BNO085 over UART: publishes /bno085/imu, /navheading, /mag, and watches itself.
+"""BNO085 over UART: publishes /bno085/imu, /navheading, /mag, /mag_uncal, and watches itself.
 
 The sensor is opened through adafruit_bno08x, whose UART code reads for ever when
 the port has no timeout and loops for ever in soft_reset() when the sensor does
@@ -26,12 +26,25 @@ pause before a new try 0, 1, 2, 4 ... ~backoff_max_s seconds.  From
                          state backoff|connecting|ok|stalled|failed
                          reason, failures, attempt, packet_age_s, frame_errors,
                          sensor_reset_t (wall time of the last sensor reset: a
-                         new value means a new yaw origin), pid
+                         new value means a new yaw origin), pid,
+                         mag_accuracy (0-3, BNO calibration accuracy of the
+                         calibrated magnetometer report 0x03),
+                         mag_uncal (on|no data|unavailable|off; 'no data'
+                         also when 0x0F stops for ~mag_uncal_stale_s),
+                         mag_uncal_accuracy, mag_bias_uT (BNO's own hard-iron
+                         estimate from report 0x0F)
+      bno085/mag_uncal   sensor_msgs/MagneticField (tesla), report 0x0F
+                         "magnetic field uncalibrated": not touched by the BNO
+                         dynamic calibration; published per new report (~20 Hz)
+
+Report 0x0F is optional: when the sensor does not enable it, the node runs on
+without it and logs one warning.  The BNO dynamic calibration is left as it is.
   exit 0 shutdown, 1 connect failed, 2 packets stopped, 3 port lost, 4 hard exit
 """
 import json
 import logging
 import os
+import struct
 import sys
 import threading
 import time
@@ -48,8 +61,35 @@ from adafruit_bno08x.uart import BNO08X_UART
 CHANNEL_SHTP_COMMAND = 0
 CHANNEL_EXE = 1
 CHANNEL_SENSOR_REPORTS = 3
+BNO_REPORT_MAG_UNCAL = 0x0F
+MAG_UNCAL_LEN = 16
+Q4 = 2.0 ** -4
 EXIT_OK, EXIT_CONNECT, EXIT_STALL, EXIT_PORT, EXIT_HARD = 0, 1, 2, 3, 4
 SHTP_ADVERTISE_RESEND_S = 1.0
+
+
+def parse_mag_uncal(report):
+    """SH-2 report 0x0F, 16 bytes: id, seq, status (accuracy in bits 1:0), delay,
+    X Y Z uncalibrated, X Y Z hard-iron bias; int16 little endian, Q4 microtesla.
+    Returns ((x, y, z) uT, (bx, by, bz) uT, accuracy)."""
+    if len(report) < MAG_UNCAL_LEN or report[0] != BNO_REPORT_MAG_UNCAL:
+        raise ValueError('not a 0x0F report: %r' % bytes(report[:2]))
+    v = struct.unpack_from('<6h', bytes(report), 4)
+    return tuple(x * Q4 for x in v[:3]), tuple(x * Q4 for x in v[3:]), report[2] & 0x03
+
+
+def register_mag_uncal():
+    """Teach the library the length of report 0x0F (its batch splitter needs it).
+    False when this library version has no such table."""
+    try:
+        reports = adafruit_bno08x._AVAIL_SENSOR_REPORTS
+        reports.setdefault(BNO_REPORT_MAG_UNCAL, (Q4, 3, MAG_UNCAL_LEN))
+        return reports[BNO_REPORT_MAG_UNCAL][2] == MAG_UNCAL_LEN
+    except Exception:  # noqa: BLE001
+        return False
+
+
+MAG_UNCAL_SUPPORTED = register_mag_uncal()
 
 
 class UartSilent(Exception):
@@ -106,6 +146,11 @@ class BoundedBNO(BNO08X_UART):
         self.should_stop = should_stop
         self.last_report_t = None
         self.frame_errors = 0
+        self.mag_uncal = None            # (x, y, z) uT
+        self.mag_bias = None             # (x, y, z) uT
+        self.mag_uncal_accuracy = None
+        self.mag_uncal_count = 0
+        self._uncal_in_packet = False
         super().__init__(uart, reset=None, debug=False)
 
     def initialize(self):
@@ -149,12 +194,24 @@ class BoundedBNO(BNO08X_UART):
 
     def _handle_packet(self, packet):
         # As the library, without print(packet) on each damaged packet.
+        self._uncal_in_packet = False
         try:
             _separate_batch(packet, self._packet_slices)
             while self._packet_slices:
                 self._process_report(*self._packet_slices.pop())
         finally:
             del self._packet_slices[:]
+
+    def _process_report(self, report_id, report_bytes):
+        if report_id != BNO_REPORT_MAG_UNCAL:
+            return super()._process_report(report_id, report_bytes)
+        # Reports of a batch come newest first (pop from the end): keep the first.
+        if self._uncal_in_packet:
+            return None
+        self._uncal_in_packet = True
+        self.mag_uncal, self.mag_bias, self.mag_uncal_accuracy = parse_mag_uncal(report_bytes)
+        self.mag_uncal_count += 1
+        return None
 
     def poll(self):
         self._process_available_packets(max_packets=200)
@@ -236,11 +293,15 @@ class BNO085Node:
         self.stable_s = rospy.get_param('~stable_s', 10.0)
         self.backoff_max_s = rospy.get_param('~backoff_max_s', 30.0)
         self.max_failures = rospy.get_param('~max_failures', 8)
+        self.want_mag_uncal = rospy.get_param('~mag_uncal', True)
+        self.mag_uncal_warn_s = rospy.get_param('~mag_uncal_warn_s', 5.0)
+        self.mag_uncal_stale_s = rospy.get_param('~mag_uncal_stale_s', 2.0)
         self.failures = rospy.get_param('~failures', 0)
 
         self.imu_pub = rospy.Publisher('bno085/imu', Imu, queue_size=10)
         self.nevheading_pub = rospy.Publisher('bno085/navheading', Imu, queue_size=10)
         self.mag_pub = rospy.Publisher('bno085/mag', MagneticField, queue_size=10)
+        self.mag_uncal_pub = rospy.Publisher('bno085/mag_uncal', MagneticField, queue_size=10)
         self.imu_status_pub = rospy.Publisher('bno085/imu_status', Imu_status, queue_size=10)
         self.health_pub = rospy.Publisher('bno085/health', String, queue_size=1, latch=True)
         self.msg_bno085_status = Imu_status()
@@ -252,6 +313,11 @@ class BNO085Node:
         self.reason = ''
         self.attempt = 0
         self.sensor_reset_t = 0.0
+        self.mag_uncal_state = 'off'     # on | no data | unavailable | off
+        self.mag_uncal_warned = False
+        self.mag_uncal_sent = 0
+        self.mag_uncal_enabled_t = 0.0
+        self.mag_uncal_last_t = 0.0
         self.supervisor = Supervisor(rospy.is_shutdown, self.publish_status, self.log_hard)
         self.supervisor.start()
 
@@ -271,6 +337,7 @@ class BNO085Node:
     def publish_status(self):
         age = self.bno.report_age() if self.bno is not None else None
         fresh = self.state == 'ok' and age is not None and age <= self.stale_s
+        bno = self.bno
         self.msg_bno085_status.status = fresh
         self.msg_bno085_status.header.stamp = rospy.Time.now()
         self.imu_status_pub.publish(self.msg_bno085_status)
@@ -279,7 +346,12 @@ class BNO085Node:
             'failures': self.failures, 'attempt': self.attempt,
             'packet_age_s': None if age is None else round(age, 2),
             'frame_errors': self.bno.frame_errors if self.bno is not None else 0,
-            'sensor_reset_t': self.sensor_reset_t, 'pid': os.getpid()})))
+            'sensor_reset_t': self.sensor_reset_t, 'pid': os.getpid(),
+            'mag_accuracy': getattr(bno, '_magnetometer_accuracy', None) if bno is not None else None,
+            'mag_uncal': self.mag_uncal_state,
+            'mag_uncal_accuracy': bno.mag_uncal_accuracy if bno is not None else None,
+            'mag_bias_uT': [round(v, 2) for v in bno.mag_bias]
+            if bno is not None and bno.mag_bias is not None else None})))
 
     def wait(self, seconds):
         """A pause that a shutdown ends at once."""
@@ -308,7 +380,38 @@ class BNO085Node:
             self.bno.enable_feature(feature)
             self.supervisor.beat(self.init_limit_s)
         self.sensor_reset_t = time.time()
+        self.enable_mag_uncal()
         rospy.loginfo("<{}> UART connected.".format(rospy.get_caller_id()))
+
+    def warn_mag_uncal(self, text):
+        if not self.mag_uncal_warned:
+            self.mag_uncal_warned = True
+            rospy.logwarn("<{}> {}".format(rospy.get_caller_id(), text))
+
+    def enable_mag_uncal(self):
+        """Report 0x0F, optional: a refusal costs ~2 s per try, never the connection."""
+        if not self.want_mag_uncal:
+            self.mag_uncal_state = 'off'
+            return
+        if not MAG_UNCAL_SUPPORTED:
+            self.mag_uncal_state = 'unavailable'
+            self.warn_mag_uncal('magnetometer report 0x0F not supported by this adafruit_bno08x, '
+                                '/bno085/mag_uncal off')
+            return
+        error = None
+        self.mag_uncal_sent = 0
+        for _ in range(2):
+            try:
+                self.bno.enable_feature(BNO_REPORT_MAG_UNCAL)
+                self.mag_uncal_state = 'no data'
+                self.mag_uncal_enabled_t = time.monotonic()
+                return
+            except (RuntimeError, PacketError, IndexError, KeyError, ValueError, struct.error) as exc:
+                error = exc
+            finally:
+                self.supervisor.beat(self.init_limit_s)
+        self.mag_uncal_state = 'unavailable'
+        self.warn_mag_uncal('magnetometer report 0x0F not enabled ({}), /bno085/mag_uncal off'.format(error))
 
     def connect(self):
         """True when the sensor streams; False after the tries or at a shutdown."""
@@ -377,6 +480,13 @@ class BNO085Node:
                     self.publish_mag()
                     self.publish_imu()
                     self.publish_imu_heading()
+                    try:
+                        self.publish_mag_uncal()
+                    except (serial.SerialException, OSError, rospy.ROSException):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - optional topic, never stops the IMU
+                        rospy.logwarn_throttle(60.0, "<{}> mag_uncal: {!r}".format(
+                            rospy.get_caller_id(), exc))
             except (serial.SerialException, OSError) as exc:
                 self.note_failure('stalled', 'port lost: {}'.format(exc))
                 return EXIT_PORT
@@ -452,6 +562,32 @@ class BNO085Node:
         mag_msg.magnetic_field.z = mag_z * 0.000001
         mag_msg.magnetic_field_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
         self.mag_pub.publish(mag_msg)
+
+    def publish_mag_uncal(self):
+        bno = self.bno
+        if self.mag_uncal_state not in ('on', 'no data'):
+            return
+        now = time.monotonic()
+        if bno.mag_uncal_count == self.mag_uncal_sent:
+            if self.mag_uncal_state == 'on' and now - self.mag_uncal_last_t > self.mag_uncal_stale_s:
+                self.mag_uncal_state = 'no data'       # 0x0F stopped while the rest streams
+                self.mag_uncal_enabled_t = now
+            elif self.mag_uncal_state == 'no data' and now - self.mag_uncal_enabled_t > self.mag_uncal_warn_s:
+                self.warn_mag_uncal('magnetometer report 0x0F enabled but no data for %.0f s'
+                                    % self.mag_uncal_warn_s)
+            return
+        self.mag_uncal_sent = bno.mag_uncal_count
+        self.mag_uncal_last_t = now
+        self.mag_uncal_state = 'on'
+        x, y, z = bno.mag_uncal
+        msg = MagneticField()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "bno_imu_link"
+        msg.magnetic_field.x = x * 0.000001
+        msg.magnetic_field.y = y * 0.000001
+        msg.magnetic_field.z = z * 0.000001
+        msg.magnetic_field_covariance = [0.025, 0.0, 0.0, 0.0, 0.025, 0.0, 0.0, 0.0, 0.025]
+        self.mag_uncal_pub.publish(msg)
 
     def publish_imu_heading(self):
         acc_x, acc_y, acc_z = self.bno.acceleration

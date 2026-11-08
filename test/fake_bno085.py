@@ -8,7 +8,8 @@ import time
 import tty
 
 CH_COMMAND, CH_EXE, CH_CONTROL, CH_REPORTS = 0, 1, 2, 3
-REPORT_LEN = {0x01: 10, 0x02: 10, 0x03: 10, 0x04: 10, 0x05: 14, 0x06: 10, 0x08: 12, 0x09: 14}
+REPORT_LEN = {0x01: 10, 0x02: 10, 0x03: 10, 0x04: 10, 0x05: 14, 0x06: 10, 0x08: 12, 0x09: 14,
+              0x0F: 16}
 REPORT_LEN.pop(0x06)
 
 
@@ -37,6 +38,8 @@ class FakeSensor(object):
         self.partial_once = False    # a cut frame, then deaf until the next request
         self.stream_stopped = False
         self.corrupt_one = False
+        self.refuse = set()          # feature ids it does not enable (no answer, no stream)
+        self.silent_reports = set()  # enabled, but these reports stop coming
         self.adverts = self.resets = 0
         self.features = set()
         self.seq = 0
@@ -118,6 +121,8 @@ class FakeSensor(object):
             self._reply(CH_CONTROL, bytes([0xf8, 0, 3, 2]) + struct.pack('<IIH', 10003608, 7, 1) + bytes(2))
         elif channel == CH_CONTROL and data[:1] == b'\xfd':
             feature = data[1]
+            if feature in self.refuse:
+                return
             self._reply(CH_CONTROL, bytes([0xfc, feature]) + bytes(15))
             self.features.add(feature)
 
@@ -134,7 +139,7 @@ class FakeSensor(object):
             if self.mute or self.stream_stopped:
                 continue
             ids = sorted(self.features) if self.features else ([0x01, 0x02, 0x08] if self.pre_stream else [])
-            ids = [i for i in ids if i in REPORT_LEN]
+            ids = [i for i in ids if i in REPORT_LEN and i not in self.silent_reports]
             for rid in ids:
                 self.seq += 1
                 payload = bytes([0xfb, 0, 0, 0, 0]) + self._report(rid, n)
