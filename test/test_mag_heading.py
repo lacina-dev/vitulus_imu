@@ -118,7 +118,7 @@ def test_self_calibration_and_heading_within_one_degree(calibrated):
     # +-3/4 deg tilt: the 2D model leaves ~1 deg (soft iron couples the vertical field).
     assert np.median(e) < 1.2 and np.percentile(e, 99) < 3.0, (np.median(e), np.percentile(e, 99))
     assert all(o['ok'] for _, _, o in after), set(tuple(o['reasons']) for _, _, o in after)
-    assert after[-1][2]['sigma_deg'] == 6.0
+    assert after[-1][2]['sigma_deg'] == 8.0
 
 
 def test_level_ground_heading_within_half_degree():

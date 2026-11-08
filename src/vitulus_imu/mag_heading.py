@@ -498,7 +498,7 @@ class MagHeadingEstimator(object):
         'max_dIncl_deg': 6.0,
         'max_gyro_std_deg': 4.0,
         'max_gyro_drift_deg': 6.0,
-        'sigma_ok_deg': 6.0,
+        'sigma_ok_deg': 8.0,
         'imu_max_age_s': 0.2,
         'stale_s': 1.0,
         'rtk_cov_max': 0.01,          # rad^2, orientation_covariance[8]

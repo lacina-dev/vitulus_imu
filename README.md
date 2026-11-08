@@ -32,7 +32,7 @@ Absolute heading from the magnetometer for times without RTK, with a
 | in `~mag_topic` | sensor_msgs/MagneticField | default `/bno085/mag_uncal` |
 | in `~imu_topic` | sensor_msgs/Imu | default `/bno085/imu` (game rotation vector: levelling + gyro) |
 | in `~rtk_topic` | sensor_msgs/Imu | default `/gnss_heading/navheading`, valid when `orientation_covariance[8] < ~rtk_cov_max` |
-| out `/bno085/mag_heading` | sensor_msgs/Imu | ~10 Hz, only with a calibration; orientation = yaw only; `orientation_covariance` = `[1e3,0,0, 0,1e3,0, 0,0,σ²]`, σ = `~sigma_ok_deg` (6°) when the state is `ok`, else σ² = 1e3; angular velocity / acceleration covariance −1 (not provided) |
+| out `/bno085/mag_heading` | sensor_msgs/Imu | ~10 Hz, only with a calibration; orientation = yaw only; `orientation_covariance` = `[1e3,0,0, 0,1e3,0, 0,0,σ²]`, σ = `~sigma_ok_deg` (8°) when the state is `ok`, else σ² = 1e3; angular velocity / acceleration covariance −1 (not provided) |
 | out `/bno085/mag_heading/status` | std_msgs/String JSON | latched, 1 Hz (below) |
 
 **Yaw convention:** the same as `/gnss_heading/navheading` (ENU, yaw of Euler
@@ -133,3 +133,14 @@ nice -n 10 python3 -m pytest test/test_mag_heading.py -q
 nice -n 10 python3 -m pytest test/test_bno085_mag_uncal.py -q
 nice -n 10 python3 test/test_bno085_recovery.py [--old-ref REF]
 ```
+
+## Field test 2026-11-09 (uncal source, self-calibrated from RTK)
+
+Drive with three full turns, straights and arcs up to 10 m from the dock:
+self-calibration accepted after ~4 min (36 of 36 bins), Fref 46.8 µT,
+inclination 64.4° (Earth here ~49 µT / ~66°), vertical hard-iron 14 µT.
+Live error against RTK heading: median ~4°, p90 ~7°, max ~11°; in `ok`
+max 8.6° (hence `sigma_ok_deg` 8°). About 2° of the median comes from RTK
+heading latency (~0.1 s) during fast turns (up to 1.6 rad/s); standing
+still the error at one spot was a steady +6° (local field / heading-dependent
+residual), so treat the heading as a coarse prior, not as a fine reference.
