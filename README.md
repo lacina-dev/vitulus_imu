@@ -50,6 +50,9 @@ the two can be compared directly.
   `gyro_std` (std of mag − gyro over 5 s ≥ 10°: a field that swings),
   `gyro_drift` (mean innovation of the fusion over 10 s ≥ 6°: the
   magnetometer and the gyro-carried heading disagree for seconds),
+  `anchor` (the correction is ≥ `~max_anchor_dev_deg`, 10°, further from its
+  anchor than the gyro can have drifted: a field that is off for minutes,
+  see **Sigma**),
   `warmup` (fusion window below 4.5 s, or less than 4 s of data).  Published
   with σ² = 1e3.  Near the dock the field is ~24 % off: `disturbed` there is
   right; the heading itself is then carried by the gyro from the last good
@@ -63,7 +66,8 @@ the two can be compared directly.
 the correction is held), `freeze_standing`, `motion`
 (`moving` / `standing` / `unknown`), `note` (only when the wheel odometry is
 missing: runs without the freeze), `axis_weighting`, `resets`, `last_reset`,
-`correction_range_deg` and `hold_age_s` (what sigma is made of, below);
+`anchor` (`rtk` / `start` / null), `anchor_age_s`, `anchor_dev_deg` and
+`hold_age_s` (what sigma is made of, below);
 `calibration` (`version`, age, centre, semi-axes, offset, Fref, Iref, residual
 p50/p90, bins, samples, `axis_weights`);
 `self_cal` (samples, bins covered/needed, last fit with its reason);
@@ -127,18 +131,38 @@ heading is valid: `err_deg` (current error), and over the last
      magnetometer sample.  A sample that arrives before the IMU message of
      its time waits for it (the two topics are not delivered in step: on the
      bags up to 0.13 s, which is 8° in a turn).
-   - **Sigma.**  The gate cannot see a field that is off but inside the
-     limits (3–5 µT in the horizontal is 8–12° and passes): the correction
-     follows it within a minute or two.  So σ of an `ok` output is
-     max(base, `~sigma_k` (0.6) × (range of the correction over the last
-     `~sigma_window_s` (300 s) + |mean innovation over 10 s| + gyro drift
-     since the last fused sample at `~gyro_drift_deg_min` (0.2°/min))), with
-     base = `~sigma_ok_deg` (4°), or `~sigma_start_deg` (8°) while the window
-     is below `~sigma_settle_s` (30 s).  A heading that the magnetometer has
-     just pulled by 10° is published with σ ≥ 6° until five minutes later,
-     both while the field is off and while the heading comes back (about
-     80 s).  A field that is off for longer than `~sigma_window_s` is not
-     told apart from the truth.
+   - **Sigma and the anchor.**  The gate cannot see a field that is off but
+     inside the limits (3–5 µT in the horizontal is 8–12° and passes): the
+     correction follows it within a minute or two, for as long as it lasts
+     (a long fence, a steel hall).  But the correction (magnetometer − gyro)
+     can truly change only as fast as the gyro drifts, about 0.2°/min.  So it
+     is compared with an **anchor**:
+     - while the RTK heading is a valid reference (full fix, variance band,
+       agrees with the gyro, settled) the anchor is the correction RTK
+       implies (RTK − gyro over the last 30 messages, minus the calibration
+       offset) and is renewed all the time; when RTK goes, it stays;
+     - before any RTK the anchor is the correction itself at the moment the
+       window first reached `~sigma_settle_s` (30 s).  That one is not
+       confirmed — the filter may have started in a disturbed place — and σ
+       stays at `~sigma_start_deg` (8°) until RTK has been seen;
+     - a restart of the filter (game yaw origin) or a new calibration voids it.
+
+     deviation = |correction − anchor| (`fusion.anchor_dev_deg`), and
+
+     σ = max(base, `~sigma_k` (0.6) × (deviation + |mean innovation over 10 s|)
+     + `~gyro_drift_deg_min` (0.2°/min) × time since the last fused sample)
+
+     with base = `~sigma_ok_deg` (4°) when the anchor is confirmed by RTK and
+     the window is ≥ 30 s, else `~sigma_start_deg` (8°).  The part of the
+     deviation that the gyro drift cannot explain (deviation − 0.2°/min ×
+     anchor age) at or above `~max_anchor_dev_deg` (10°) makes the state
+     `disturbed`, reason `anchor`.  A calibration that is 1–3° off between
+     drives is a deviation of 1–3° and does not lift σ (0.6 × 3° < 4°).
+     With time since the last RTK the gyro drift explains more (after an
+     hour 12°): the state then stays `ok`, but σ still takes the whole
+     deviation, because a drift of the gyro and a field that crept off
+     cannot be told apart any more.  While the robot stands (correction
+     frozen) σ grows by the full 0.2°/min of the hold.
 5. Gate as above, F = hypot(|Hc|·H0, Bz), I = atan2(−Bz, |Hc|·H0), H0 = mean semi-axis.
 6. Self-calibration: while RTK is valid (and has been for `~rtk_settle_s`,
    5 s; RTK samples that disagree with the gyro by > 15° are ignored, see
@@ -189,8 +213,10 @@ itself is refused.  A node from before version 2 refuses a version 2 file
 (`calibration version 2`, it starts `uncalibrated` and calibrates again from
 RTK).  For that case the version 1 file is copied to
 `mag_calibration.v1.yaml` next to it before the first version 2 write (once;
-an existing copy is never replaced): going back to the old code = copy it
-over `mag_calibration.yaml`.  Calibrations with a non-finite or
+an existing copy is never replaced; on a file system without hard links it
+is written directly; if it cannot be made the node logs one warning and
+saves anyway): going back to the old code = copy it over
+`mag_calibration.yaml`.  Calibrations with a non-finite or
 degenerate value are refused at load; a non-finite input or result is not
 published as a heading (`reasons: ["invalid"]`).  Files without `hard_uT`
 load with h = 0.
@@ -204,7 +230,7 @@ A new robot (no file) is `uncalibrated` until it has turned through ≥ 30 of
 and every key of `MagHeadingEstimator.DEFAULTS` (`fuse_tau_s`,
 `freeze_standing`, `axis_weighting`, `max_dF_pct`, `max_dIncl_deg`,
 `max_gyro_std_deg`, `max_gyro_drift_deg`, `sigma_ok_deg`, `sigma_k`,
-`sigma_window_s`, `freeze_max_s`, `rtk_cov_min`,
+`max_anchor_dev_deg`, `anchor_from_rtk`, `freeze_max_s`, `rtk_cov_min`,
 `rtk_cov_max`, `rtk_require_fixed`, `rtk_settle_s`, `self_calibrate`,
 `min_bins`, `fit_max_p90_deg`, ...).
 
@@ -276,10 +302,28 @@ with `fuse_tau_s` 120 s 1.3 / 2.2 / 3.4.  With the filter restarted every
 60 s (the worst case for the growing window) the state `ok` reaches 7.9°
 while the window is below 30 s — hence `sigma_start_deg` 8°; with the window
 grown the largest smoothed error in `ok` is 3.6–4.0° and the raw p90 3.8° —
-`sigma_ok_deg` 4°.  Synthetic check of what the gate lets through (steady
-3 / 5 µT in the horizontal for 180 s): the heading follows by 8 / 12° and is
-back 80 s after the end; all the time the output is either `disturbed` or
-`ok` with error ≤ 1.7σ (σ 5.4–7 / 7.2–9.5°).
+`sigma_ok_deg` 4°.
+
+Synthetic check of what the field gate lets through (steady field in the
+horizontal, no RTK while it lasts; the heading follows it and is back about
+80 s after the end).  Every output is either `disturbed` or `ok` with the
+error inside 2σ:
+
+| field | largest error | state | σ in `ok` | worst error / σ |
+|---|---|---|---|---|
+| 3 µT for 180 s | 7.8° | `ok` | 4–7.6° | 1.7 |
+| 5 µT for 180 s | 12.0° | `disturbed` (`anchor`), `ok` at the edges | up to 9.9° | 1.2 |
+| 3 µT for 420 s | 8.1° | `ok` | 4–7.8° | 1.7 |
+| 4 µT for 600 s | 10.3° | `ok` | 4–9.0° | 1.7 |
+| 5 µT for 600 s | 12.3° | `disturbed` (`anchor`) 60 %, else `ok` | up to 10.2° | 1.7 |
+| 0 → 6 µT over 600 s, held 300 s | 14.2° | `ok` to 12°, then `disturbed` (`anchor`) | up to 10.2° | 1.3 |
+| 10 µT for 180 s | 18.7° | `disturbed` (`field`, `anchor`) | – | 0.9 |
+
+(anchor confirmed by RTK before; with the unconfirmed start anchor σ is 8° or
+more and the worst case is 1.5σ.)  On the three drives the anchor changes
+neither the accuracy nor the share of `ok` (the reason `anchor` never
+appears), σ in `ok` has a median of 4.0°, and the same holds when RTK is
+taken away 60 s after it first became valid (4–11 min without RTK).
 
 The mower motor adds no visible disturbance: the per-sample noise is the same
 with the knife on and off (1.2 / 1.8 µT in sensor x / y), the mean horizontal
@@ -292,9 +336,12 @@ heading, a map by position and a 3D ellipsoid did not hold between drives.
 
 Limits: the cross-drive error is mostly a constant 1–3° (the ellipse centre
 and offset move between drives); the drives were short (≤ 14 min, strips ≤ 2 m)
-— on long straight strips a field that is locally off for longer than
-`fuse_tau_s` is followed, and `gyro_drift` (mean innovation ≥ 6° over 10 s)
-is the only gate that sees it.
+— a field that is locally off for longer than `fuse_tau_s` is followed; the
+anchor then lifts σ and, from 10°, the state.  What it cannot see: a field
+that creeps off slower than the gyro drifts (0.2°/min), and a robot that has
+never had RTK since the filter started (σ stays 8°).  While RTK is valid the
+anchor is RTK itself, so the comparison in `rtk_compare` and the state are
+then not independent: an error ≥ 10° against RTK reads `disturbed`.
 
 ## Field test 2026-11-09 (first version, 1 s window; uncal source, self-calibrated from RTK)
 

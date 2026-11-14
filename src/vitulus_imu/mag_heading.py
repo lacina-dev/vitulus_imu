@@ -279,7 +279,9 @@ def keep_old_format(path):
     """Before a file of an older format is overwritten: a copy next to it,
     NAME.v<version>.yaml, written once (an existing copy is never replaced)
     and atomically.  A node from before the current format refuses the new
-    file, the copy is what it can go back to.  Returns the copy's path or None."""
+    file, the copy is what it can go back to.  Returns the copy's path or None.
+    Where hard links are not available the copy is written directly (created
+    exclusively, so still never replacing; removed again if the write fails)."""
     version = _file_version(path)
     if version is None or version < 1 or version >= CAL_VERSION:
         return None
@@ -293,9 +295,26 @@ def keep_old_format(path):
             out.write(src.read())
             out.flush()
             os.fsync(out.fileno())
-        os.link(tmp, copy)           # fails when the copy appeared meanwhile: never replaces
-    except FileExistsError:
-        return None
+        try:
+            os.link(tmp, copy)       # fails when the copy appeared meanwhile: never replaces
+        except FileExistsError:
+            return None
+        except OSError:              # no hard links on this file system
+            try:
+                fd2 = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                return None
+            try:
+                with os.fdopen(fd2, 'wb') as out, open(tmp, 'rb') as src:
+                    out.write(src.read())
+                    out.flush()
+                    os.fsync(out.fileno())
+            except BaseException:
+                try:
+                    os.unlink(copy)
+                except OSError:
+                    pass
+                raise
     finally:
         try:
             os.unlink(tmp)
@@ -304,17 +323,20 @@ def keep_old_format(path):
     return copy
 
 
-def save_calibration(path, cal):
+def save_calibration(path, cal, warn=None):
     """Atomic write (temporary file + rename in the same directory).  A file
-    of an older format is first copied aside (keep_old_format)."""
+    of an older format is first copied aside (keep_old_format); when that
+    fails the save goes on and warn(text) is called (the node: rospy.logwarn)."""
     import yaml
     path = os.path.expanduser(path)
     folder = os.path.dirname(path) or '.'
     os.makedirs(folder, exist_ok=True)
     try:
         keep_old_format(path)
-    except (OSError, IOError):
-        pass                         # the copy is a convenience, the save goes on
+    except Exception as exc:  # noqa: BLE001 - the copy is a convenience, the save goes on
+        if warn is not None:
+            warn('mag_heading: could not keep a copy of the old-format calibration %s (%r); '
+                 'an older node will not read the new file' % (path, exc))
     fd, tmp = tempfile.mkstemp(prefix='.mag_cal_', dir=folder)
     try:
         with os.fdopen(fd, 'w') as fh:
@@ -642,12 +664,25 @@ class MagHeadingEstimator(object):
         'sigma_start_deg': 8.0,       # state ok with a window below sigma_settle_s
         'sigma_settle_s': 30.0,
         # sigma also covers what the gate cannot see: a field that is off but
-        # within the gate pulls the correction for minutes.  sigma >= sigma_k x
-        # (range of the correction over sigma_window_s + |mean innovation| +
-        # gyro drift since the last fused sample): 0.5 would make error = 2 sigma.
+        # within the gate pulls the correction for as long as it lasts.  The
+        # correction (magnetometer - gyro) can truly change only as fast as the
+        # gyro drifts, so it is compared with an anchor: the correction the RTK
+        # heading implied when it was last valid (full fix), or, until RTK has
+        # been seen, the correction after the window first grew to
+        # sigma_settle_s (not confirmed: sigma stays sigma_start_deg).
+        #   deviation   = |correction - anchor|
+        #   sigma = max(base, sigma_k x (deviation + |mean innovation|)
+        #                     + gyro_drift_deg_min x time since the last fused sample)
+        #   unexplained = deviation - gyro_drift_deg_min x anchor age
+        #   unexplained >= max_anchor_dev_deg: state disturbed, reason 'anchor'
+        # sigma takes the whole deviation: an hour after the last RTK a drift of
+        # the gyro and a field that crept off look the same, so sigma grows
+        # (0.2 deg/min: 7 deg after an hour) while the state stays ok.
+        # sigma_k 0.5 would make error = 2 sigma.
         'sigma_k': 0.6,
-        'sigma_window_s': 300.0,
         'gyro_drift_deg_min': 0.2,    # drift of the game rotation vector (measured 0.12..0.19)
+        'anchor_from_rtk': True,
+        'max_anchor_dev_deg': 10.0,
         'imu_max_age_s': 0.2,
         'stale_s': 1.0,
         # RTK heading as reference: yaw variance (rad^2, orientation_covariance[8])
@@ -692,7 +727,6 @@ class MagHeadingEstimator(object):
         self.imu = Ring(3, 1024)          # t, game yaw (unwrapped), |yaw rate|
         self.mot = Ring(2, 512)           # t, |v| of the wheel odometry
         self.q = Ring(6, 2048)            # t, F, incl, heading_raw - game yaw, innovation, used
-        self.dhist = Ring(2, 1024)        # t, correction: once a second, for sigma
         self.bins = SampleBins(p['n_bins'], p['per_bin'], p['window_k'])
         self.pending = deque(maxlen=64)  # magnetometer samples waiting for the IMU of their time
         self.level = None
@@ -734,7 +768,7 @@ class MagHeadingEstimator(object):
             k = min(1.0, self.p['fuse_init_s'] / self.f_W) if self.f_W > 0 else 1.0
             self.f_W *= k
             self.f_Lam *= k
-            self.dhist.clear()       # heading_raw changed its meaning, not the field
+            self.anc = None          # heading_raw changed its meaning, not the field
         self.cal = cal
         self._set_weights()
         return True
@@ -929,8 +963,8 @@ class MagHeadingEstimator(object):
         self.f_field_ok = True
         self.frozen = False
         self.f_used_t = None     # time of the last fused sample
+        self.anc = None          # anchor of the correction: (value rad, time, 'rtk' / 'start')
         self.q.clear()
-        self.dhist.clear()
 
     def _gyro_restart(self, reason):
         """The game yaw origin moved: the correction and the RTK-gyro offset are void."""
@@ -991,7 +1025,7 @@ class MagHeadingEstimator(object):
                 self.f_d = wrap(h - self.yaw_m)
                 self.f_Lam = self.f_W = 0.0
                 self.f_apart_t = None
-                self.dhist.clear()
+                self.anc = None
                 self.resets += 1
                 self.reset_reason = 'magnetometer and gyro %.0f deg apart for %.0f s' % (
                     innov * DEG, p['fuse_reset_s'])
@@ -1009,21 +1043,42 @@ class MagHeadingEstimator(object):
             self.f_d += (qj0 * (hx - c) + qj1 * (hy + s)) / self.f_Lam
             self.f_W += dt
             self.f_used_t = t
-        if self.f_W >= p['fuse_init_s'] and (self.dhist.n == 0 or t - self.dhist.rows()[-1, 0] >= 1.0):
-            self.dhist.append((t, self.f_d))
 
-    def _sigma(self, t, drift):
-        """(sigma deg of an ok output, range of the correction deg, age of the
-        last fused sample s)."""
+    def _anchor(self, t):
+        """Keeps the anchor of the correction.  While the RTK heading is a valid
+        reference (full fix, band, agrees with the gyro, settled) the anchor is
+        the correction RTK implies: RTK - gyro (mean of the last 30 messages)
+        minus the calibration offset.  Without RTK the anchor stays where RTK
+        left it; before any RTK it is the correction itself once the window
+        has grown to sigma_settle_s (kind 'start', not confirmed)."""
         p = self.p
-        h = self.dhist.since(t - p['sigma_window_s'])
-        lo = min(float(h[:, 1].min()), self.f_d) if len(h) else self.f_d
-        hi = max(float(h[:, 1].max()), self.f_d) if len(h) else self.f_d
-        rng = (hi - lo) * DEG
-        age = 0.0 if self.f_used_t is None else max(0.0, t - self.f_used_t)
-        bound = rng + (drift or 0.0) + p['gyro_drift_deg_min'] * age / 60.0
-        base = p['sigma_ok_deg'] if self.f_W >= p['sigma_settle_s'] else p['sigma_start_deg']
-        return max(base, p['sigma_k'] * bound), rng, age
+        if p['anchor_from_rtk'] and self.t_rtk is not None and len(self.anchors) >= 5 \
+                and abs(t - self.t_rtk) <= p['rtk_hold_s'] and t - self.t_rtk_since >= p['rtk_settle_s']:
+            a = float(circmean(list(self.anchors))) - self.cal.offset
+            if math.isfinite(a):
+                self.anc = (self.f_d + wrap(a - self.f_d), t, 'rtk')
+                return
+        if self.anc is None and self.f_W >= p['sigma_settle_s']:
+            self.anc = (self.f_d, t, 'start')
+
+    def _deviation(self, t):
+        """(deviation of the correction from the anchor, deg; the part of it
+        the gyro drift does not explain, deg; age of the anchor, s);
+        (0, 0, None) without an anchor."""
+        if self.anc is None:
+            return 0.0, 0.0, None
+        age = max(0.0, t - self.anc[1])
+        dev = abs(self.f_d - self.anc[0]) * DEG
+        return dev, max(0.0, dev - self.p['gyro_drift_deg_min'] * age / 60.0), age
+
+    def _sigma(self, t, drift, dev):
+        """(sigma deg of an ok output, age of the last fused sample s)."""
+        p = self.p
+        hold = 0.0 if self.f_used_t is None else max(0.0, t - self.f_used_t)
+        confirmed = self.anc is not None and self.anc[2] == 'rtk'
+        base = p['sigma_ok_deg'] if confirmed and self.f_W >= p['sigma_settle_s'] else p['sigma_start_deg']
+        return max(base, p['sigma_k'] * (dev + (drift or 0.0))
+                   + p['gyro_drift_deg_min'] * hold / 60.0), hold
 
     # -- output ---------------------------------------------------------------
 
@@ -1074,13 +1129,18 @@ class MagHeadingEstimator(object):
             out = {'t': t, 'state': 'disturbed', 'ok': False, 'reasons': ['invalid'], 'yaw': None}
             self.out = out
             return out
+        self._anchor(t)
+        dev, unexplained, anchor_age = self._deviation(t)
+        if unexplained >= p['max_anchor_dev_deg']:
+            reasons.append('anchor')
         ok = not reasons
-        sigma, rng, age = self._sigma(t, drift)
+        sigma, hold = self._sigma(t, drift, dev)
         if not math.isfinite(sigma):
             ok, reasons = False, reasons + ['invalid']
         out = {'t': t, 'state': 'ok' if ok else 'disturbed', 'ok': ok, 'reasons': reasons,
                'yaw': yaw, 'sigma_deg': sigma if ok else None,
-               'correction_range_deg': rng, 'hold_age_s': age,
+               'anchor': None if self.anc is None else self.anc[2], 'anchor_age_s': anchor_age,
+               'anchor_dev_deg': dev, 'hold_age_s': hold,
                'dF_pct': dF, 'dIncl_deg': dI, 'gyro_std_deg': gyro_std, 'gyro_drift_deg': drift,
                'fuse_tau_eff_s': self.f_W, 'frozen': self.frozen, 'moving': self.f_moving}
         ref = self.rtk_yaw(t)
@@ -1157,7 +1217,9 @@ class MagHeadingEstimator(object):
         s['fusion'] = {
             'tau_s': p['fuse_tau_s'], 'tau_eff_s': r2(self.f_W, 1),
             'frozen': bool(self.frozen and state != 'stale'),
-            'correction_range_deg': r2(None if out is None else out.get('correction_range_deg')),
+            'anchor': None if out is None else out.get('anchor'),
+            'anchor_age_s': r2(None if out is None else out.get('anchor_age_s'), 0),
+            'anchor_dev_deg': r2(None if out is None else out.get('anchor_dev_deg')),
             'hold_age_s': r2(None if out is None else out.get('hold_age_s'), 0),
             'freeze_standing': fz,
             'motion': 'unknown' if moving is None else ('moving' if moving else 'standing'),

@@ -171,7 +171,7 @@ class MagHeadingNode(object):
                 cal = self.est.cal
             if changed:
                 try:
-                    save_calibration(self.cal_file, cal)
+                    save_calibration(self.cal_file, cal, warn=rospy.logwarn)
                 except (OSError, IOError) as exc:
                     rospy.logwarn_throttle(600, 'mag_heading: cannot save %s: %s' % (self.cal_file, exc))
             if changed and not res['accepted']:

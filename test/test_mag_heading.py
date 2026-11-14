@@ -454,8 +454,12 @@ def test_fusion_window_grows_then_settles(calibrated):
     assert errors([x for x in outs if 6001.0 < x[0] < 6006.0]).max() < 3.0     # usable while growing
     assert errors(late).max() < 1.5
     sig = {round(t - 6000.0): o['sigma_deg'] for t, _, o in late}
-    assert sig[20] == 8.0 and sig[99] == 4.0                 # sigma_start_deg, then sigma_ok_deg
+    # sigma_start_deg while the window grows, and for as long as no RTK heading
+    # has confirmed the correction (it may have grown in a disturbed place).
+    assert sig[20] == 8.0 and sig[99] == 8.0
+    assert outs[-1][2]['anchor'] == 'start' and [o['anchor'] for t, _, o in outs if t < 6020.0][-1] is None
     s = e.status(outs[-1][0])
+    assert s['fusion']['anchor'] == 'start' and 55.0 < s['fusion']['anchor_age_s'] < 75.0
     assert s['fusion']['tau_s'] == 60.0 and 45.0 < s['fusion']['tau_eff_s'] <= 60.0
     assert s['fusion']['frozen'] is False and s['fusion']['motion'] == 'unknown'
     assert 'note' in s['fusion']                             # no odometry: says it runs without the freeze
@@ -746,58 +750,187 @@ def test_rtk_variance_outside_the_band_is_not_a_reference(cov):
 
 # -- sigma covers what the gate cannot see ----------------------------------------
 
+WOBBLE = lambda t: 0.7 + 0.1 * math.sin(0.3 * t)          # noqa: E731
+
+
+def anchored(est, t0, warm=60.0, yaw_fn=WOBBLE, **params):
+    """An estimator that drove warm seconds with a valid RTK heading (the anchor
+    of the correction is confirmed), and the time it ended."""
+    e = mh.MagHeadingEstimator(est.cal, source='uncal', self_calibrate=False, **params)
+    outs = simulate(e, t0, warm, yaw_fn, seed=3)
+    assert outs[-1][2]['anchor'] == 'rtk' and outs[-1][2]['sigma_deg'] == 4.0
+    return e, t0 + warm
+
+
+def covered(outs):
+    """Largest error / sigma over the ok outputs (0 when none is ok)."""
+    return max([abs(mh.wrap(o['yaw'] - y)) * mh.DEG / o['sigma_deg'] for _, y, o in outs if o['ok']] or [0.0])
+
+
 @pytest.mark.parametrize('amp', [3.0, 5.0])
 def test_long_steady_disturbance_is_covered_by_sigma(calibrated, amp):
     """A steady horizontal field within the field gate for 3 min (a long car, a
-    fence): the correction follows it by 8 / 12 deg.  Every output is either
-    disturbed or ok with error <= 2 sigma; after the field is clean again the
-    heading comes back within two minutes."""
-    e = mh.MagHeadingEstimator(calibrated[0].cal, source='uncal', self_calibrate=False)
-    outs = simulate(e, 3000.0, 400.0, lambda t: 0.7 + 0.1 * math.sin(0.3 * t), rtk=False, seed=5,
+    fence), no RTK: the correction follows it by 8 / 12 deg.  Every output is
+    either disturbed or ok with error <= 2 sigma; after the field is clean
+    again the heading comes back within two minutes and sigma with it."""
+    e, t0 = anchored(calibrated[0], 2940.0)
+    outs = simulate(e, t0, 400.0, WOBBLE, rtk=False, seed=5,
                     extra=lambda t: np.array([0.0, amp, 0.0]) if 3060.0 < t < 3240.0 else 0.0)
-    worst = 0.0
-    for t, y, o in outs:
-        if o['ok']:
-            worst = max(worst, abs(mh.wrap(o['yaw'] - y)) * mh.DEG / o['sigma_deg'])
-    assert worst <= 2.0, worst
+    assert covered(outs) <= 2.0, covered(outs)
     inside = [x for x in outs if 3200.0 < x[0] < 3240.0]
     assert errors(inside).max() > 6.0                              # the heading did follow the field
     ok_in = [o for _, _, o in inside if o['ok']]
     assert all(o['sigma_deg'] > 4.2 for o in ok_in)                # and sigma says so
-    assert errors([x for x in outs if x[0] > 3360.0]).max() < 3.0  # back 2 min after the end
-    assert outs[-1][2]['correction_range_deg'] > 6.0               # still remembered (sigma_window_s)
-    # Clean run of the same length: sigma stays at sigma_ok_deg.
-    e2 = mh.MagHeadingEstimator(calibrated[0].cal, source='uncal', self_calibrate=False)
-    clean = simulate(e2, 3000.0, 150.0, lambda t: 0.7 + 0.1 * math.sin(0.3 * t), rtk=False, seed=5)
-    assert all(o['sigma_deg'] == 4.0 for t, _, o in clean if t > 3060.0)
+    assert all(o['anchor_dev_deg'] > 6.0 and o['anchor'] == 'rtk' for _, _, o in inside)
+    if amp == 5.0:
+        assert all('anchor' in o['reasons'] for _, _, o in inside)  # beyond max_anchor_dev_deg: disturbed
+    back = [x for x in outs if x[0] > 3360.0]
+    assert errors(back).max() < 3.0                                # back 2 min after the end
+    assert all(o['ok'] and o['sigma_deg'] == 4.0 for _, _, o in back[-50:])
+    # Clean run: sigma stays at sigma_ok_deg without RTK.
+    e2, t0 = anchored(calibrated[0], 2940.0)
+    clean = simulate(e2, t0, 150.0, WOBBLE, rtk=False, seed=5)
+    assert all(o['sigma_deg'] == 4.0 and o['ok'] for _, _, o in clean)
+
+
+@pytest.mark.parametrize('amp,dur', [(3.0, 420.0), (4.0, 600.0), (5.0, 600.0)])
+def test_disturbance_longer_than_any_window_stays_covered(calibrated, amp, dur):
+    """A long fence or a steel hall: the field is off for 7 - 10 min.  The
+    deviation from the anchor does not fade with time (a sliding window did:
+    sigma fell back to 4 deg at 12 deg of error)."""
+    e, t0 = anchored(calibrated[0], 2940.0)
+    outs = simulate(e, t0, 60.0 + dur + 180.0, WOBBLE, rtk=False, seed=5,
+                    extra=lambda t: np.array([0.0, amp, 0.0]) if 3060.0 < t < 3060.0 + dur else 0.0)
+    assert covered(outs) <= 2.0, covered(outs)
+    late = [x for x in outs if 3060.0 + dur - 60.0 < x[0] < 3060.0 + dur]
+    assert errors(late).min() > 2.3 * amp                          # 8 / 10 / 12 deg, to the end
+    for _, y, o in late:
+        assert not o['ok'] or o['sigma_deg'] >= 0.6 * 2.3 * amp
+    if amp == 5.0:
+        # disturbed while the gyro drift cannot explain 10 deg; ten minutes
+        # later it explains 2 of the 12 and the state may return, sigma 7 deg
+        first = [o for t, _, o in outs if 3180.0 < t < 3360.0]
+        assert np.mean(['anchor' in o['reasons'] for o in first]) > 0.9
+    back = [x for x in outs if x[0] > 3060.0 + dur + 150.0]
+    assert errors(back).max() < 2.5 and all(o['ok'] for _, _, o in back)
+
+
+def test_slowly_growing_disturbance_is_covered(calibrated):
+    """0 -> 6 uT over 10 min, then held: 1.4 deg/min, too slow for gyro_drift
+    (mean innovation), seven times faster than the gyro can drift."""
+    e, t0 = anchored(calibrated[0], 2940.0)
+    outs = simulate(e, t0, 900.0, WOBBLE, rtk=False, seed=5,
+                    extra=lambda t: np.array([0.0, min(6.0, 6.0 * max(t - 3060.0, 0.0) / 600.0), 0.0]))
+    assert covered(outs) <= 2.0, covered(outs)
+    assert not any('gyro_drift' in o['reasons'] for _, _, o in outs)
+    end = [x for x in outs if x[0] > 3780.0]
+    assert errors(end).min() > 12.0
+    assert all(o['state'] == 'disturbed' and 'anchor' in o['reasons'] for _, _, o in end)
+    mid = [o for t, _, o in outs if 3300.0 < t < 3420.0 and o['ok']]
+    assert mid and all(o['sigma_deg'] > 4.0 for o in mid)          # sigma grows before the state changes
+
+
+def test_anchor_follows_rtk_and_calibration_shift_keeps_sigma(calibrated):
+    """The calibration is 2.5 deg off (it moves by 1 - 3 deg between drives):
+    the anchor is what RTK implies, the deviation is the known 2.5 deg and
+    sigma stays at sigma_ok_deg, with RTK and after it is lost."""
+    import copy
+    cal = copy.deepcopy(calibrated[0].cal)
+    cal.offset += D(2.5)
+    e = mh.MagHeadingEstimator(cal, source='uncal', self_calibrate=False)
+    outs = simulate(e, 4000.0, 60.0, WOBBLE, seed=3)
+    outs += simulate(e, 4060.0, 120.0, WOBBLE, rtk=False, seed=4)
+    late = [x for x in outs if x[0] > 4050.0]
+    assert all(o['ok'] and o['sigma_deg'] == 4.0 and o['anchor'] == 'rtk' for _, _, o in late)
+    assert all(1.5 < o['anchor_dev_deg'] < 3.5 for _, _, o in late)
+    assert 100.0 < late[-1][2]['anchor_age_s'] < 125.0
+    assert abs(np.median(errors(late)) - 2.5) < 0.7
+
+
+def test_anchor_is_not_confirmed_by_rtk_without_full_fix(calibrated):
+    e = mh.MagHeadingEstimator(calibrated[0].cal, source='uncal', self_calibrate=False)
+    outs = simulate(e, 4300.0, 60.0, WOBBLE, seed=3, relpos=FLOAT)
+    assert outs[-1][2]['anchor'] == 'start' and outs[-1][2]['sigma_deg'] == 8.0
+    outs = simulate(e, 4360.0, 20.0, WOBBLE, seed=4)               # a full fix arrives
+    assert outs[-1][2]['anchor'] == 'rtk' and outs[-1][2]['sigma_deg'] == 4.0
+    assert [o['sigma_deg'] for t, _, o in outs if t < 4364.0][-1] == 8.0     # not before RTK has settled
+
+
+def test_start_in_a_disturbed_place_is_seen_when_rtk_arrives(calibrated):
+    """The filter starts inside a 5 uT field without RTK: the anchor is only the
+    start value (sigma 8 deg covers the 12 deg).  RTK arrives: the anchor is
+    the truth and the state turns disturbed."""
+    e = mh.MagHeadingEstimator(calibrated[0].cal, source='uncal', self_calibrate=False)
+    field = lambda t: np.array([0.0, 5.0, 0.0])                    # noqa: E731
+    outs = simulate(e, 4500.0, 90.0, WOBBLE, rtk=False, seed=5, extra=field)
+    late = [x for x in outs if x[0] > 4550.0]
+    assert errors(late).min() > 9.0 and covered(late) <= 2.0
+    assert all(o['anchor'] == 'start' for _, _, o in late)
+    outs = simulate(e, 4590.0, 30.0, WOBBLE, seed=6, extra=field)
+    end = [o for t, _, o in outs if t > 4600.0]
+    assert all(o['anchor'] == 'rtk' and 'anchor' in o['reasons'] and not o['ok'] for o in end)
+    assert all(o['anchor_dev_deg'] > 10.0 for o in end)
+
+
+def test_restart_of_the_filter_voids_the_anchor(calibrated):
+    e, t0 = anchored(calibrated[0], 4700.0)
+    outs = simulate(e, t0 + 3.0, 50.0, WOBBLE, rtk=False, seed=8, game_offset=2.0)    # IMU restart: gap, new origin
+    assert e.resets == 1
+    assert [o['anchor'] for t, _, o in outs if t < t0 + 25.0][-1] is None
+    assert outs[-1][2]['anchor'] == 'start' and outs[-1][2]['sigma_deg'] == 8.0
 
 
 def test_long_standing_holds_then_refreshes(calibrated):
     """Standing with a holding-torque field and a drifting gyro: the correction
     of the drive is held for freeze_max_s (window unchanged, sigma_ok_deg),
     then the window is cut and the standing magnetometer is let in (sigma_start_deg)."""
+    drift = D(0.5) / 60.0
     e = mh.MagHeadingEstimator(calibrated[0].cal, source='uncal', self_calibrate=False, freeze_max_s=200.0)
-    outs = simulate(e, 5000.0, 330.0, lambda t: 0.7, rtk=False, seed=7, tilt_deg=(0.2, 0.2),
-                    gyro_drift=D(0.5) / 60.0, speed=lambda t: 0.3 if t < 5060.0 else 0.0,
-                    extra=lambda t: np.array([0.0, 3.0, 0.0]) if t > 5060.0 else 0.0)
+    simulate(e, 5000.0, 60.0, lambda t: 0.7, seed=6, tilt_deg=(0.2, 0.2), gyro_drift=drift, speed=0.3)
+    outs = simulate(e, 5060.0, 270.0, lambda t: 0.7, rtk=False, seed=7, tilt_deg=(0.2, 0.2),
+                    gyro_drift=drift, game_offset=0.4 + drift * 60.0, speed=0.0,
+                    extra=lambda t: np.array([0.0, 3.0, 0.0]))
     held = [x for x in outs if 5075.0 < x[0] < 5255.0]
     w = [o['fuse_tau_eff_s'] for _, _, o in held]
-    assert all(o['frozen'] and o['ok'] and o['sigma_deg'] == 4.0 for _, _, o in held)
+    assert all(o['frozen'] and o['ok'] for _, _, o in held)
+    assert all(4.0 <= o['sigma_deg'] < 4.7 for _, _, o in held)   # sigma_ok_deg, plus the drift of the hold
     assert max(w) - min(w) < 0.01 and min(w) > 30.0               # the window does not shrink while held
     assert errors(held).max() < 2.5                               # gyro drift only (0.5 deg/min here)
     assert 150.0 < held[-1][2]['hold_age_s'] < 200.0
     late = [x for x in outs if x[0] > 5275.0]
-    assert all(o['ok'] and o['sigma_deg'] == 8.0 for _, _, o in late)
+    assert all(o['ok'] and 8.0 <= o['sigma_deg'] < 8.5 for _, _, o in late)
     assert all(2.0 < o['fuse_tau_eff_s'] < 6.0 for _, _, o in late)
     e_late = errors(late)
     assert 1.5 < e_late.max() < 16.0                              # the standing magnetometer came in, within 2 sigma
 
 
-def test_long_hold_grows_sigma_with_gyro_drift(calibrated):
-    e, outs = fused(calibrated[0], 5500.0, 60.0, speed=lambda t: 0.3)
-    assert outs[-1][2]['sigma_deg'] == 4.0
-    e.f_used_t -= 3600.0                                           # as if frozen for an hour
-    assert 7.2 <= e._sigma(e.t_mag, 0.0)[0] < 8.2      # sigma_k x (0.2 deg/min x 60 min + range of the correction)
+def test_long_hold_grows_sigma_with_the_full_gyro_drift(calibrated):
+    """Frozen for 30 / 60 min: sigma = gyro_drift_deg_min x time, not scaled by
+    sigma_k (0.15 - 0.19 deg/min measured: 4.5 - 5.7 deg after 30 min)."""
+    e, t0 = anchored(calibrated[0], 5500.0)
+    assert e._sigma(e.t_mag, 0.0, 0.0)[0] == 4.0
+    e.f_used_t -= 1800.0
+    assert abs(e._sigma(e.t_mag, 0.0, 0.0)[0] - 6.0) < 1e-6
+    e.f_used_t -= 1800.0
+    assert abs(e._sigma(e.t_mag, 0.0, 0.0)[0] - 12.0) < 1e-6
+    assert abs(e._sigma(e.t_mag, 2.0, 5.0)[0] - (12.0 + 0.6 * 7.0)) < 1e-6     # + sigma_k x (deviation + innovation)
+
+
+def test_old_anchor_grows_sigma_but_not_the_state(calibrated):
+    """An hour without RTK and the correction 11 deg from the anchor: the gyro
+    may have drifted that much (0.2 deg/min), so the state stays ok; whether
+    it did cannot be told, so sigma covers the 11 deg.  The same deviation a
+    minute after RTK is no drift: disturbed."""
+    e, t0 = anchored(calibrated[0], 5700.0)
+    a, t, kind = e.anc
+    e.anc = (a - D(11.0), t - 3600.0, kind)
+    e.p['anchor_from_rtk'] = False                                 # RTK is gone
+    out = e._output(e.t_mag)
+    assert out['ok'] and 10.0 < out['anchor_dev_deg'] < 12.0
+    assert 0.6 * 10.0 < out['sigma_deg'] < 0.6 * 12.0 + 1.0
+    e.anc = (a - D(11.0), t - 60.0, kind)
+    out = e._output(e.t_mag)
+    assert not out['ok'] and out['reasons'] == ['anchor']
 
 
 # -- IMU outage, queue of waiting samples -----------------------------------------
@@ -1008,3 +1141,47 @@ def test_node_callbacks_with_stub_rospy(tmp_path, calibrated):
     assert node.est.last_fit is not None and not node.est.last_fit['accepted']
     assert yaml.safe_load(open(cal_file))['version'] == 1
     assert os.listdir(str(tmp_path)) == ['mag_calibration.yaml']
+
+
+def test_copy_of_old_format_without_hard_links(tmp_path, calibrated, monkeypatch):
+    """A file system without hard links: the copy is written directly, still
+    never replacing an existing one."""
+    import yaml
+    d = calibrated[0].cal.to_dict()
+    d['version'] = 1
+    del d['resid_cov']
+    path = str(tmp_path / 'mag_calibration.yaml')
+    with open(path, 'w') as fh:
+        yaml.safe_dump(d, fh)
+    original = open(path, 'rb').read()
+
+    def no_link(*a, **k):
+        raise PermissionError(1, 'no hard links here')
+    monkeypatch.setattr(os, 'link', no_link)
+    warned = []
+    mh.save_calibration(path, calibrated[0].cal, warn=warned.append)
+    assert not warned
+    assert sorted(os.listdir(str(tmp_path))) == ['mag_calibration.v1.yaml', 'mag_calibration.yaml']
+    assert open(str(tmp_path / 'mag_calibration.v1.yaml'), 'rb').read() == original
+    with open(path, 'w') as fh:
+        yaml.safe_dump(dict(d, offset_deg=33.0), fh)
+    mh.save_calibration(path, calibrated[0].cal, warn=warned.append)
+    assert open(str(tmp_path / 'mag_calibration.v1.yaml'), 'rb').read() == original and not warned
+
+
+def test_failed_copy_of_old_format_warns_and_saves(tmp_path, calibrated, monkeypatch):
+    import yaml
+    d = calibrated[0].cal.to_dict()
+    d['version'] = 1
+    path = str(tmp_path / 'mag_calibration.yaml')
+    with open(path, 'w') as fh:
+        yaml.safe_dump(d, fh)
+
+    def broken(p):
+        raise OSError(30, 'read-only file system')
+    monkeypatch.setattr(mh, 'keep_old_format', broken)
+    warned = []
+    mh.save_calibration(path, calibrated[0].cal, warn=warned.append)
+    assert len(warned) == 1 and 'copy' in warned[0] and path in warned[0]
+    assert yaml.safe_load(open(path))['version'] == 2
+    mh.save_calibration(path, calibrated[0].cal)                   # without a warn function: silent, still saves
