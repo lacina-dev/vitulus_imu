@@ -14,18 +14,33 @@ Pipeline (all in the sensor frame bno_imu_link, field in microtesla):
   3. Calibration (2D, in the levelled frame): Hc = W (Bl_xy - c), where c is
      what is left of the hard-iron centre and W maps the ellipse onto the unit
      circle (soft iron).  heading_raw = -atan2(Hc_y, Hc_x); yaw = heading_raw + offset.
-  4. Smoothing without lag: the difference d = heading_raw - game_yaw changes
-     slowly, so yaw = game_yaw_now + circmean_{last smooth_s}(d) + offset.
+  4. Slow fusion with the gyro: yaw = game_yaw_now + d + offset, where the
+     correction d (heading_raw - game_yaw) is a recursive least-squares
+     estimate with exponential forgetting (time constant fuse_tau_s).  Each
+     sample pulls d by its residual in the unit plane, r = Hc - (cos a, -sin a)
+     with a = game_yaw + d, weighted by the information matrix Q = inverse of
+     the residual covariance of the calibration (2x2, body axes: the axis the
+     drive current disturbs counts less).  The information starts at zero, so
+     the window grows with the data (effective constant ~ min(elapsed, tau)).
+     Samples in a bad field (gate below) are not used; while the robot stands
+     (wheel odometry + gyro) d is frozen and the gyro carries the heading.
+     A step of the game yaw (IMU restart: gap, impossible rate, or the
+     magnetometer and the gyro apart for seconds) starts the filter again.
   5. Quality gate ("trust / do not trust"), all without RTK:
        dF   = |F - Fref| / Fref     F = hypot(|Hc| H0, Bz), H0 = mean semi-axis
        dI   = |incl - Iref|         incl = atan2(-Bz, |Hc| H0)
-       gyro_std   = std(d) over gyro_std_window_s
-       gyro_drift = change of circmean(d) over drift_window_s
+       gyro_std   = std(heading_raw - game_yaw) over gyro_std_window_s
+       gyro_drift = |mean innovation (heading_raw - game_yaw - d)| of the used
+                    samples over drift_window_s
   6. Self-calibration from the RTK heading: while the RTK heading is valid,
      levelled samples (decimated) are kept in bins by RTK yaw; once enough bins
      are covered, an ellipse is fitted to the per-bin medians, the offset to the
      RTK yaw is taken, samples with an odd field strength are dropped, and the
-     result is accepted only when its residual against RTK is small.
+     result is accepted only when its residual against RTK is small.  The
+     residual covariance for step 4 comes from the same samples.  The RTK
+     heading counts as a reference only with a full carrier fix
+     (NAV-RELPOSNED carrSoln FIXED + heading valid) and a yaw variance in
+     the healthy band, as in navi_transform.
 
 Yaw convention: the same as /gnss_heading/navheading (ENU, Euler 'ZYX' yaw of
 the orientation quaternion); the offset absorbs the mounting and the magnetic
@@ -42,7 +57,8 @@ import numpy as np
 
 TWO_PI = 2.0 * math.pi
 DEG = 180.0 / math.pi
-CAL_VERSION = 1
+CAL_VERSION = 2            # 2: resid_cov (axis weighting); version 1 files load without it
+CAL_VERSIONS = (1, 2)
 
 
 def wrap(a):
@@ -124,13 +140,38 @@ def level(L, b):
     return np.einsum('...ij,...j->...i', L, b)
 
 
+def axis_information(C, max_ratio=25.0):
+    """(Q, weighted): information matrix of the unit-plane residual covariance C,
+    scaled to a mean eigenvalue of 1.  A missing, non-finite or degenerate C
+    gives the identity (both axes count the same) and weighted False; the
+    eigenvalue ratio is limited to max_ratio."""
+    eye = np.eye(2)
+    if C is None:
+        return eye, False
+    try:
+        C = np.asarray(C, float).reshape(2, 2)
+    except (TypeError, ValueError):
+        return eye, False
+    if not np.all(np.isfinite(C)):
+        return eye, False
+    try:
+        ev, V = np.linalg.eigh((C + C.T) / 2.0)
+    except np.linalg.LinAlgError:
+        return eye, False
+    if not np.all(np.isfinite(ev)) or ev[1] <= 1e-12 or ev[0] < -1e-9 * ev[1]:
+        return eye, False
+    q = 1.0 / np.maximum(ev, ev[1] / max_ratio)
+    q *= 2.0 / q.sum()
+    return V @ np.diag(q) @ V.T, True
+
+
 class Calibration(object):
     """3D hard iron (sensor frame), 2D soft iron in the levelled frame, the
     references for the gate."""
 
     def __init__(self, center, W, radii, offset=0.0, source='uncal', Fref=None, Iref=None,
                  resid_p50_deg=None, resid_p90_deg=None, bins=0, samples=0, created=None,
-                 hard=(0.0, 0.0, 0.0), best_p90_deg=None):
+                 hard=(0.0, 0.0, 0.0), best_p90_deg=None, resid_cov=None, version=CAL_VERSION):
         self.hard = np.asarray(hard, float).reshape(3)
         self.center = np.asarray(center, float).reshape(2)
         self.W = np.asarray(W, float).reshape(2, 2)
@@ -146,6 +187,12 @@ class Calibration(object):
         self.samples = int(samples)
         self.created = float(created) if created is not None else 0.0
         self.best_p90_deg = best_p90_deg if best_p90_deg is not None else resid_p90_deg
+        # Residual covariance in the unit plane (2x2) for the axis weighting;
+        # None (old file, too few samples, unusable matrix) = both axes the same.
+        self.resid_cov = None
+        if resid_cov is not None and axis_information(resid_cov)[1]:
+            self.resid_cov = np.asarray(resid_cov, float).reshape(2, 2)
+        self.version = int(version)
         self.check()
 
     def check(self):
@@ -162,12 +209,17 @@ class Calibration(object):
         """Raw field b (...,3) and R_level (...,9) -> as apply()."""
         return self.apply(level(L, np.asarray(b, float) - self.hard))
 
+    def unit(self, bl):
+        """bl (...,3) levelled field -> Hc x, y (unit plane, body axes)."""
+        bl = np.asarray(bl, float)
+        v = bl[..., :2] - self.center
+        return (self.W[0, 0] * v[..., 0] + self.W[0, 1] * v[..., 1],
+                self.W[1, 0] * v[..., 0] + self.W[1, 1] * v[..., 1])
+
     def apply(self, bl):
         """bl (...,3) levelled field -> heading_raw, F, inclination (rad), |Hc|."""
         bl = np.asarray(bl, float)
-        v = bl[..., :2] - self.center
-        hx = self.W[0, 0] * v[..., 0] + self.W[0, 1] * v[..., 1]
-        hy = self.W[1, 0] * v[..., 0] + self.W[1, 1] * v[..., 1]
+        hx, hy = self.unit(bl)
         hn = np.hypot(hx, hy)
         hut = hn * self.H0
         bz = bl[..., 2]
@@ -190,6 +242,7 @@ class Calibration(object):
             'resid_p50_deg': r(self.resid_p50_deg, 2),
             'resid_p90_deg': r(self.resid_p90_deg, 2),
             'best_p90_deg': r(self.best_p90_deg, 2),
+            'resid_cov': None if self.resid_cov is None else [[r(v, 8) for v in row] for row in self.resid_cov],
             'bins': self.bins,
             'samples': self.samples,
             'created': r(self.created, 1),
@@ -201,22 +254,67 @@ class Calibration(object):
     def from_dict(cls, d):
         if not isinstance(d, dict):
             raise ValueError('not a mapping')
-        if int(d.get('version', 0)) != CAL_VERSION:
+        if int(d.get('version', 0)) not in CAL_VERSIONS:
             raise ValueError('calibration version %r' % d.get('version'))
         return cls(d['center_uT'], d['W'], d['radii_uT'], math.radians(d['offset_deg']),
                    d['source'], d.get('Fref_uT'),
                    None if d.get('Iref_deg') is None else math.radians(d['Iref_deg']),
                    d.get('resid_p50_deg'), d.get('resid_p90_deg'),
                    d.get('bins', 0), d.get('samples', 0), d.get('created'),
-                   d.get('hard_uT') or (0.0, 0.0, 0.0), d.get('best_p90_deg'))
+                   d.get('hard_uT') or (0.0, 0.0, 0.0), d.get('best_p90_deg'),
+                   d.get('resid_cov'), d.get('version'))
+
+
+def _file_version(path):
+    """Format version of a calibration file, None when unreadable or absent."""
+    import yaml
+    try:
+        with open(path) as fh:
+            return int(yaml.safe_load(fh).get('version', 0))
+    except Exception:  # noqa: BLE001 - anything unreadable is simply not an old calibration
+        return None
+
+
+def keep_old_format(path):
+    """Before a file of an older format is overwritten: a copy next to it,
+    NAME.v<version>.yaml, written once (an existing copy is never replaced)
+    and atomically.  A node from before the current format refuses the new
+    file, the copy is what it can go back to.  Returns the copy's path or None."""
+    version = _file_version(path)
+    if version is None or version < 1 or version >= CAL_VERSION:
+        return None
+    root, ext = os.path.splitext(path)
+    copy = '%s.v%d%s' % (root, version, ext or '.yaml')
+    if os.path.exists(copy):
+        return None
+    fd, tmp = tempfile.mkstemp(prefix='.mag_cal_', dir=os.path.dirname(path) or '.')
+    try:
+        with os.fdopen(fd, 'wb') as out, open(path, 'rb') as src:
+            out.write(src.read())
+            out.flush()
+            os.fsync(out.fileno())
+        os.link(tmp, copy)           # fails when the copy appeared meanwhile: never replaces
+    except FileExistsError:
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return copy
 
 
 def save_calibration(path, cal):
-    """Atomic write (temporary file + rename in the same directory)."""
+    """Atomic write (temporary file + rename in the same directory).  A file
+    of an older format is first copied aside (keep_old_format)."""
     import yaml
     path = os.path.expanduser(path)
     folder = os.path.dirname(path) or '.'
     os.makedirs(folder, exist_ok=True)
+    try:
+        keep_old_format(path)
+    except (OSError, IOError):
+        pass                         # the copy is a convenience, the save goes on
     fd, tmp = tempfile.mkstemp(prefix='.mag_cal_', dir=folder)
     try:
         with os.fdopen(fd, 'w') as fh:
@@ -345,6 +443,22 @@ def smoothed_raw(cal, snap):
     return circmean(h + snap['win_dyaw'], weights=snap['win_w'], axis=1)
 
 
+def residual_cov(cal, snap, keep=None, min_samples=100):
+    """Covariance (2x2, unit plane, body axes) of the smooth_s-mean residual
+    Hc - (cos p, -sin p), p = RTK yaw - offset, over the kept samples; None
+    when there are too few samples or the result is unusable."""
+    hx, hy = cal.unit(level(snap['win_L'], snap['win_b'] - cal.hard))
+    p = snap['ref'][:, None] - snap['win_dyaw'] - cal.offset
+    w = snap['win_w']
+    r = np.c_[np.sum((hx - np.cos(p)) * w, axis=1), np.sum((hy + np.sin(p)) * w, axis=1)]
+    if keep is not None:
+        r = r[keep]
+    if len(r) < min_samples or not np.all(np.isfinite(r)):
+        return None
+    C = np.cov(r.T)
+    return C if axis_information(C)[1] else None
+
+
 def estimate_hard(b, L, ref, prior_hz=0.0, prior_tilt_deg=0.3):
     """3D hard iron (sensor frame) by linear least squares on RTK samples.
 
@@ -444,6 +558,7 @@ def fit_calibration(snap, source, min_bins=30, min_per_bin=3, reject_dF_pct=12.0
     cal.resid_p50_deg = float(np.percentile(err, 50))
     cal.resid_p90_deg = float(np.percentile(err, 90))
     cal.bins, cal.samples, cal.created = res['coverage'], int(keep.sum()), now
+    cal.resid_cov = residual_cov(cal, snap, keep)
     res.update(cal=cal, p50_deg=round(cal.resid_p50_deg, 2), p90_deg=round(cal.resid_p90_deg, 2))
     if not all(np.isfinite(x) for x in (cal.offset, cal.Fref, cal.Iref, cal.resid_p90_deg)):
         res['reason'] = 'non-finite fit'
@@ -457,6 +572,10 @@ def fit_calibration(snap, source, min_bins=30, min_per_bin=3, reject_dF_pct=12.0
         res['current_p90_deg'] = round(float(np.percentile(e_cur, 90)), 2)
         if res['current_p90_deg'] < max_p90_deg:
             best = current.best_p90_deg if current.best_p90_deg is not None else current.resid_p90_deg
+            if current.resid_cov is None:
+                # A calibration from before the axis weighting that still fits:
+                # its residual covariance, in case this fit is refused.
+                res['current_cov'] = residual_cov(current, snap, keep)
         else:
             res['current_p90_deg'] = None
     res['best_p90_deg'] = None if best is None else round(float(best), 2)
@@ -490,18 +609,53 @@ def summary(x):
 class MagHeadingEstimator(object):
     DEFAULTS = {
         'source': 'uncal',            # magnetometer report the calibration belongs to
-        'smooth_s': 1.0,
+        'smooth_s': 1.0,              # window of the field gates and of the fit residual
         'out_period_s': 0.1,          # output and gate rate
+        # Fusion with the gyro (game rotation vector drifts ~0.15 deg/min)
+        'fuse_tau_s': 60.0,           # forgetting time constant of the correction
+        'fuse_init_s': 5.0,           # window below which the output is 'warmup' and standing does not freeze
+        'fuse_reset_deg': 30.0,       # used samples this far from the gyro ...
+        'fuse_reset_s': 3.0,          # ... for this long: the game yaw origin moved, start again
+        'imu_gap_reset_s': 1.0,       # IMU silent this long (node restart): start again
+        'max_yaw_rate': 8.0,          # rad/s, a faster game yaw is a step of its origin
+        'axis_weighting': True,       # weight by the residual covariance of the calibration
+        'freeze_standing': True,      # no correction from the magnetometer while standing
+        # The frozen (or field-gated) correction is held this long, then the
+        # window is cut so that the magnetometer takes over again.  30 min of
+        # gyro drift (0.12..0.19 deg/min) is 3.6..5.7 deg: about what the
+        # standing magnetometer is off (holding torque, typ. 4, up to 7 deg).
+        'freeze_max_s': 1800.0,
+        'standing_v_max': 0.05,       # m/s, mean |v| of the wheel odometry over motion_window_s
+        'standing_wz_max': 0.1,       # rad/s, mean |gyro z| over motion_window_s
+        'motion_window_s': 1.0,
+        'motion_max_age_s': 0.5,      # odometry older than this: motion unknown, no freeze
         'gyro_std_window_s': 5.0,
         'drift_window_s': 10.0,
         'max_dF_pct': 8.0,
         'max_dIncl_deg': 6.0,
-        'max_gyro_std_deg': 4.0,
+        'max_gyro_std_deg': 10.0,     # per-sample noise is 3..7.5 deg in normal driving (2026-11-08 bags)
         'max_gyro_drift_deg': 6.0,
-        'sigma_ok_deg': 8.0,
+        # Cross test 2026-11-08 (calibration of one bag, the other replayed),
+        # state ok: max 3.7 deg with the window grown; max 7.9 deg in the first
+        # 30 s of window after a restart of the filter.
+        'sigma_ok_deg': 4.0,
+        'sigma_start_deg': 8.0,       # state ok with a window below sigma_settle_s
+        'sigma_settle_s': 30.0,
+        # sigma also covers what the gate cannot see: a field that is off but
+        # within the gate pulls the correction for minutes.  sigma >= sigma_k x
+        # (range of the correction over sigma_window_s + |mean innovation| +
+        # gyro drift since the last fused sample): 0.5 would make error = 2 sigma.
+        'sigma_k': 0.6,
+        'sigma_window_s': 300.0,
+        'gyro_drift_deg_min': 0.2,    # drift of the game rotation vector (measured 0.12..0.19)
         'imu_max_age_s': 0.2,
         'stale_s': 1.0,
-        'rtk_cov_max': 0.01,          # rad^2, orientation_covariance[8]
+        # RTK heading as reference: yaw variance (rad^2, orientation_covariance[8])
+        # in the healthy band and NAV-RELPOSNED carrSoln FIXED, as navi_transform.
+        'rtk_cov_min': 0.00043,
+        'rtk_cov_max': 0.00079,
+        'rtk_require_fixed': True,
+        'relpos_max_age_s': 0.3,      # RELPOSNED received at most this long before the heading
         'rtk_hold_s': 1.0,            # RTK yaw carried by the gyro this long
         'rtk_gyro_tol_deg': 15.0,     # RTK glitch: off from the RTK-gyro offset by more
         'self_calibrate': True,
@@ -529,16 +683,21 @@ class MagHeadingEstimator(object):
         if unknown:
             raise ValueError('unknown parameters: %s' % sorted(unknown))
         self.p = dict(self.DEFAULTS, **params)
+        p = self.p
         self.cal = None
         self.cal_note = ''
-        if cal is not None:
-            self.set_calibration(cal)
-        p = self.p
-        self.mag = Ring(14, 4096)         # t, raw b x y z, R_level (9), game yaw (unwrapped)
-        self.imu = Ring(2, 1024)          # t, game yaw (unwrapped)
+        self.Q = np.eye(2)
+        self.weighted = False
+        self.mag = Ring(14, 256)          # t, raw b x y z, R_level (9), game yaw (unwrapped)
+        self.imu = Ring(3, 1024)          # t, game yaw (unwrapped), |yaw rate|
+        self.mot = Ring(2, 512)           # t, |v| of the wheel odometry
+        self.q = Ring(6, 2048)            # t, F, incl, heading_raw - game yaw, innovation, used
+        self.dhist = Ring(2, 1024)        # t, correction: once a second, for sigma
         self.bins = SampleBins(p['n_bins'], p['per_bin'], p['window_k'])
+        self.pending = deque(maxlen=64)  # magnetometer samples waiting for the IMU of their time
         self.level = None
         self.yaw_u = None
+        self.yaw_m = None                # game yaw (unwrapped) at the magnetometer sample in work
         self.t_imu = None
         self.t_mag = None
         self.last_b = None
@@ -551,10 +710,17 @@ class MagHeadingEstimator(object):
         self.rtk_rejects = 0
         self.rtk_used = 0
         self.rtk_glitches = 0
+        self.rtk_reason = 'no RTK heading'
+        self.relpos = None               # (receive time, flags) of the last NAV-RELPOSNED
         self.out = None
         self.last_err = None
-        self.errors = deque()            # (t, |err| deg, ok)
+        self.errors = deque()            # (t, |err| deg, ok, moving: True / False / None)
         self.last_fit = None
+        self.resets = 0
+        self.reset_reason = None
+        self._fuse_clear()
+        if cal is not None:
+            self.set_calibration(cal)
 
     # -- inputs ---------------------------------------------------------------
 
@@ -562,18 +728,70 @@ class MagHeadingEstimator(object):
         if cal is not None and cal.source != self.p['source']:
             self.cal_note = 'calibration for source %r refused (running %r)' % (cal.source, self.p['source'])
             return False
+        if cal is not self.cal and self.f_d is not None:
+            # The correction belongs to the old calibration: keep it as a start,
+            # let the new samples take over within fuse_init_s.
+            k = min(1.0, self.p['fuse_init_s'] / self.f_W) if self.f_W > 0 else 1.0
+            self.f_W *= k
+            self.f_Lam *= k
+            self.dhist.clear()       # heading_raw changed its meaning, not the field
         self.cal = cal
+        self._set_weights()
         return True
 
-    def on_imu(self, t, qx, qy, qz, qw):
+    def _set_weights(self):
+        cov = self.cal.resid_cov if self.cal is not None and self.p['axis_weighting'] else None
+        self.Q, self.weighted = axis_information(cov)
+
+    def on_imu(self, t, qx, qy, qz, qw, wz=None):
+        """Game rotation vector; wz = gyro z (rad/s), None: from the yaw.
+        Returns the output dict when a waiting magnetometer sample became due
+        (see on_mag), else None."""
         lv = quat_level(qx, qy, qz, qw)
         if lv is None:
-            return
+            return None
         yaw, L = lv
         self.level = L[0] + L[1] + L[2]
-        self.yaw_u = yaw if self.yaw_u is None else self.yaw_u + wrap(yaw - self.yaw_u)
+        if self.yaw_u is None:
+            self.yaw_u = yaw
+            rate = 0.0
+        else:
+            dt = t - self.t_imu
+            step = wrap(yaw - self.yaw_u)
+            rate = abs(step) / max(dt, 0.005)
+            if dt > self.p['imu_gap_reset_s'] or dt < -self.p['imu_gap_reset_s']:
+                self._gyro_restart('IMU gap %.1f s' % dt)
+                rate = 0.0
+            elif abs(step) > self.p['max_yaw_rate'] * max(dt, 0.05):   # stamps jitter: not below 50 ms
+                self._gyro_restart('game yaw step %.0f deg' % (step * DEG))
+                rate = 0.0
+            self.yaw_u += step
+        if wz is not None and math.isfinite(wz):
+            rate = abs(wz)
         self.t_imu = t
-        self.imu.append((t, self.yaw_u))
+        self.imu.append((t, self.yaw_u, rate))
+        out = None
+        while self.pending and self.pending[0][0] <= t:
+            tm, b = self.pending.popleft()
+            if t - tm <= self.p['imu_max_age_s']:
+                out = self._mag_sample(tm, b) or out
+        return out
+
+    def on_motion(self, t, v):
+        """Wheel odometry: forward speed (m/s)."""
+        if math.isfinite(t) and math.isfinite(v):
+            self.mot.append((t, abs(v)))
+
+    def moving(self, t):
+        """True / False from the wheel odometry and the gyro, None when unknown."""
+        p = self.p
+        m = self.mot.since(t - p['motion_window_s'])
+        if len(m) == 0 or t - m[-1, 0] > p['motion_max_age_s'] or m[-1, 0] - t > p['motion_max_age_s']:
+            return None
+        g = self.imu.since(t - p['motion_window_s'])
+        if len(g) == 0:
+            return None
+        return bool(m[:, 1].mean() > p['standing_v_max'] or g[:, 2].mean() > p['standing_wz_max'])
 
     def game_yaw_at(self, t):
         r = self.imu.rows()
@@ -581,13 +799,39 @@ class MagHeadingEstimator(object):
             return None
         return float(np.interp(t, r[:, 0], r[:, 1]))
 
-    def on_rtk(self, t, qx, qy, qz, qw, cov_yaw):
-        """True when the RTK heading was taken as reference."""
-        if not (cov_yaw < self.p['rtk_cov_max']) or (qx == qy == qz == qw == 0.0) \
-                or not all(math.isfinite(v) for v in (t, qx, qy, qz, qw)):
+    def on_relpos(self, t_rx, flags):
+        """NAV-RELPOSNED flags with their receive time."""
+        self.relpos = (float(t_rx), int(flags))
+
+    def _rtk_refusal(self, t, t_rx, qx, qy, qz, qw, cov_yaw):
+        p = self.p
+        if (qx == qy == qz == qw == 0.0) or not all(math.isfinite(v) for v in (t, qx, qy, qz, qw)):
+            return 'invalid message'
+        if not (p['rtk_cov_min'] <= cov_yaw <= p['rtk_cov_max']):
+            return 'yaw variance %.2g outside %.2g..%.2g' % (cov_yaw, p['rtk_cov_min'], p['rtk_cov_max'])
+        if p['rtk_require_fixed']:
+            if self.relpos is None:
+                return 'no NAV-RELPOSNED received'
+            age = t_rx - self.relpos[0]
+            carr = (self.relpos[1] >> 3) & 3          # FLAGS_CARR_SOLN_MASK 0x18
+            if not (-0.05 <= age <= p['relpos_max_age_s']):
+                return 'NAV-RELPOSNED stale (%.1f s)' % age
+            if carr != 2:
+                return 'carrSoln %d (not FIXED)' % carr
+            if not self.relpos[1] & 0x100:            # FLAGS_REL_POS_HEAD_VALID
+                return 'relPosHeading not valid'
+        return None
+
+    def on_rtk(self, t, qx, qy, qz, qw, cov_yaw, t_rx=None):
+        """True when the RTK heading was taken as reference.  t_rx: receive
+        time on the clock of on_relpos (default t)."""
+        why = self._rtk_refusal(t, t if t_rx is None else t_rx, qx, qy, qz, qw, cov_yaw)
+        if why is not None:
+            self.rtk_reason = why
             return False
         yg = self.game_yaw_at(t)
         if yg is None:
+            self.rtk_reason = 'no IMU data at the RTK time'
             return False
         a = wrap(quat_yaw(qx, qy, qz, qw) - yg)
         if len(self.anchors) >= 5:
@@ -596,6 +840,7 @@ class MagHeadingEstimator(object):
                 self.rtk_rejects += 1
                 self.rtk_glitches += 1
                 if self.rtk_rejects < 10:
+                    self.rtk_reason = 'glitch (off the gyro by > %g deg)' % self.p['rtk_gyro_tol_deg']
                     return False
                 self.anchors.clear()          # gyro origin moved (IMU restart): start over
         self.rtk_rejects = 0
@@ -605,6 +850,7 @@ class MagHeadingEstimator(object):
         self.anchor = float(circmean(list(self.anchors)[-5:]))
         self.t_rtk = t
         self.rtk_used += 1
+        self.rtk_reason = 'ok'
         return True
 
     def rtk_yaw(self, t):
@@ -613,10 +859,25 @@ class MagHeadingEstimator(object):
         if self.t_rtk is None or self.yaw_u is None or abs(t - self.t_rtk) > self.p['rtk_hold_s'] \
                 or t - self.t_rtk_since < self.p['rtk_settle_s']:
             return None
-        return wrap(self.yaw_u + self.anchor)
+        yg = self.game_yaw_at(t)
+        return wrap((self.yaw_u if yg is None else yg) + self.anchor)
+
+    def rtk_state(self, t):
+        """(valid, reason) of the RTK reference at time t."""
+        if self.rtk_yaw(t) is not None:
+            return True, 'ok'
+        if self.t_rtk is not None and abs(t - self.t_rtk) <= self.p['rtk_hold_s']:
+            return False, 'settling'
+        if self.rtk_reason == 'ok':
+            return False, 'no RTK heading'
+        return False, self.rtk_reason
 
     def on_mag(self, t, bx, by, bz):
-        """Field in microtesla.  Returns the output dict at out_period_s, else None."""
+        """Field in microtesla.  Returns the output dict at out_period_s, else
+        None.  The game yaw is taken at the time of the sample: a sample that
+        arrives before the IMU message of its time (the two topics are not
+        delivered in step; 0.1 s late is 5 deg in a turn) waits for it and its
+        output comes from on_imu."""
         if self.level is None or self.t_imu is None or abs(t - self.t_imu) > self.p['imu_max_age_s']:
             return None
         b = (bx, by, bz)
@@ -625,8 +886,20 @@ class MagHeadingEstimator(object):
         if not (math.isfinite(bx) and math.isfinite(by) and math.isfinite(bz)):
             return None
         self.last_b = b
-        self.mag.append((t, bx, by, bz) + self.level + (self.yaw_u,))
+        if t > self.t_imu:
+            self.pending.append((t, b))
+            return None
+        return self._mag_sample(t, b)
+
+    def _mag_sample(self, t, b):
+        yaw = self.game_yaw_at(t)
+        if yaw is None:
+            return None
+        self.yaw_m = yaw
+        self.mag.append((t,) + b + self.level + (yaw,))
         self.t_mag = t
+        if self.cal is not None:
+            self._fuse(t, b)
         if self.p['self_calibrate'] and t - self.last_sample_t >= self.p['sample_period_s']:
             ref = self.rtk_yaw(t)
             if ref is not None:
@@ -642,7 +915,115 @@ class MagHeadingEstimator(object):
         k = self.p['window_k']
         if len(w) > k:
             w = w[np.linspace(0, len(w) - 1, k).round().astype(int)]
-        self.bins.add(t, b, self.level, w[:, 1:4], w[:, 4:13], self.yaw_u - w[:, 13], ref)
+        self.bins.add(t, b, self.level, w[:, 1:4], w[:, 4:13], self.yaw_m - w[:, 13], ref)
+
+    # -- fusion with the gyro ---------------------------------------------------
+
+    def _fuse_clear(self):
+        self.f_d = None          # correction: heading_raw - game yaw (rad, continuous)
+        self.f_Lam = 0.0         # information of the correction
+        self.f_W = 0.0           # effective averaging window (s)
+        self.f_t = None
+        self.f_apart_t = None
+        self.f_moving = None
+        self.f_field_ok = True
+        self.frozen = False
+        self.f_used_t = None     # time of the last fused sample
+        self.q.clear()
+        self.dhist.clear()
+
+    def _gyro_restart(self, reason):
+        """The game yaw origin moved: the correction and the RTK-gyro offset are void."""
+        self._fuse_clear()
+        self.imu.clear()
+        self.mag.clear()
+        self.pending.clear()
+        self.anchors.clear()
+        self.t_rtk = None
+        self.resets += 1
+        self.reset_reason = reason
+
+    def _fuse(self, t, b):
+        p, cal = self.p, self.cal
+        L = self.level
+        v = (b[0] - cal.hard[0], b[1] - cal.hard[1], b[2] - cal.hard[2])
+        bl = (L[0] * v[0] + L[1] * v[1] + L[2] * v[2], L[3] * v[0] + L[4] * v[1] + L[5] * v[2],
+              L[6] * v[0] + L[7] * v[1] + L[8] * v[2])
+        hx, hy = (float(x) for x in cal.unit(bl))
+        hut = math.hypot(hx, hy) * cal.H0
+        F = math.hypot(hut, bl[2])
+        incl = math.atan2(-bl[2], hut)
+        h = -math.atan2(hy, hx)
+        if not (math.isfinite(h) and math.isfinite(F) and math.isfinite(incl)):
+            return
+        dt = 0.0 if self.f_t is None else min(max(t - self.f_t, 0.0), 1.0)
+        self.f_t = t
+        if self.f_d is None:
+            self.f_d = wrap(h - self.yaw_m)
+        innov = wrap(h - self.yaw_m - self.f_d)
+        # Field gate on the mean of the last smooth_s (as the state gate).
+        w = self.q.since(t - p['smooth_s'])
+        Fm = (w[:, 1].sum() + F) / (len(w) + 1)
+        Im = (w[:, 2].sum() + incl) / (len(w) + 1)
+        field_ok = not (cal.Fref and abs(Fm - cal.Fref) / cal.Fref * 100.0 >= p['max_dF_pct']) \
+            and not (cal.Iref is not None and abs(Im - cal.Iref) * DEG >= p['max_dIncl_deg'])
+        self.f_moving = self.moving(t)
+        self.f_field_ok = field_ok
+        self.frozen = bool(p['freeze_standing'] and self.f_moving is False and self.f_W >= p['fuse_init_s'])
+        use = field_ok and not self.frozen
+        if use:
+            k = math.exp(-dt / p['fuse_tau_s'])
+        elif self.f_used_t is not None and t - self.f_used_t > p['freeze_max_s'] \
+                and self.f_W > 0.5 * p['fuse_init_s']:
+            k = 0.5 * p['fuse_init_s'] / self.f_W      # held long enough: let new samples in
+        else:
+            k = 1.0
+        self.f_Lam *= k
+        self.f_W *= k
+        self.q.append((t, F, incl, self.f_d + innov, innov, 1.0 if use else 0.0))
+        if not use:
+            return
+        if abs(innov) * DEG > p['fuse_reset_deg']:
+            if self.f_apart_t is None:
+                self.f_apart_t = t
+            elif t - self.f_apart_t >= p['fuse_reset_s']:
+                # Not a disturbance of the field (the gate passes): the gyro origin.
+                self.f_d = wrap(h - self.yaw_m)
+                self.f_Lam = self.f_W = 0.0
+                self.f_apart_t = None
+                self.dhist.clear()
+                self.resets += 1
+                self.reset_reason = 'magnetometer and gyro %.0f deg apart for %.0f s' % (
+                    innov * DEG, p['fuse_reset_s'])
+                innov = 0.0
+        else:
+            self.f_apart_t = None
+        a = self.yaw_m + self.f_d
+        s, c = math.sin(a), math.cos(a)
+        Q = self.Q
+        qj0 = -Q[0, 0] * s - Q[0, 1] * c           # Q J, J = d(cos a, -sin a)/da
+        qj1 = -Q[1, 0] * s - Q[1, 1] * c
+        jqj = -s * qj0 - c * qj1
+        if jqj > 0.0:
+            self.f_Lam += jqj
+            self.f_d += (qj0 * (hx - c) + qj1 * (hy + s)) / self.f_Lam
+            self.f_W += dt
+            self.f_used_t = t
+        if self.f_W >= p['fuse_init_s'] and (self.dhist.n == 0 or t - self.dhist.rows()[-1, 0] >= 1.0):
+            self.dhist.append((t, self.f_d))
+
+    def _sigma(self, t, drift):
+        """(sigma deg of an ok output, range of the correction deg, age of the
+        last fused sample s)."""
+        p = self.p
+        h = self.dhist.since(t - p['sigma_window_s'])
+        lo = min(float(h[:, 1].min()), self.f_d) if len(h) else self.f_d
+        hi = max(float(h[:, 1].max()), self.f_d) if len(h) else self.f_d
+        rng = (hi - lo) * DEG
+        age = 0.0 if self.f_used_t is None else max(0.0, t - self.f_used_t)
+        bound = rng + (drift or 0.0) + p['gyro_drift_deg_min'] * age / 60.0
+        base = p['sigma_ok_deg'] if self.f_W >= p['sigma_settle_s'] else p['sigma_start_deg']
+        return max(base, p['sigma_k'] * bound), rng, age
 
     # -- output ---------------------------------------------------------------
 
@@ -652,52 +1033,62 @@ class MagHeadingEstimator(object):
             self.out = {'t': t, 'state': 'uncalibrated', 'ok': False, 'reasons': ['no calibration'],
                         'yaw': None}
             return self.out
-        r = self.mag.since(t - p['drift_window_s'] - p['smooth_s'] - 0.05)
-        h, F, incl, _ = self.cal.apply_raw(r[:, 1:4], r[:, 4:13])
-        d = np.unwrap(h - r[:, 13])
+        r = self.q.since(t - max(p['drift_window_s'], p['gyro_std_window_s'], p['smooth_s']) - 0.05)
         tt = r[:, 0]
         now_w = tt > t - p['smooth_s']
-        d_now = float(circmean(d[now_w]))
-        yaw = float(wrap(self.yaw_u + d_now + self.cal.offset))
+        if self.f_d is None or not now_w.any():
+            out = {'t': t, 'state': 'disturbed', 'ok': False, 'reasons': ['invalid'], 'yaw': None}
+            self.out = out
+            return out
+        yaw = float(wrap(self.yaw_m + self.f_d + self.cal.offset))
         reasons = []
         dF = dI = None
         if self.cal.Fref:
-            dF = abs(float(np.mean(F[now_w])) - self.cal.Fref) / self.cal.Fref * 100.0
+            dF = abs(float(np.mean(r[now_w, 1])) - self.cal.Fref) / self.cal.Fref * 100.0
             if dF >= p['max_dF_pct']:
                 reasons.append('field')
         if self.cal.Iref is not None:
-            dI = abs(float(np.mean(incl[now_w])) - self.cal.Iref) * DEG
+            dI = abs(float(np.mean(r[now_w, 2])) - self.cal.Iref) * DEG
             if dI >= p['max_dIncl_deg']:
                 reasons.append('inclination')
         gs = tt > t - p['gyro_std_window_s']
         gyro_std = None
         if tt[0] <= t - 0.8 * p['gyro_std_window_s'] and gs.sum() >= 3:
-            gyro_std = float(np.std(d[gs])) * DEG
+            gyro_std = float(np.std(r[gs, 3])) * DEG
             if gyro_std >= p['max_gyro_std_deg']:
                 reasons.append('gyro_std')
-        old_w = (tt > t - p['drift_window_s'] - p['smooth_s']) & (tt <= t - p['drift_window_s'])
+        # Mean innovation of the samples the filter used: the magnetometer and
+        # the gyro-carried heading disagree for seconds.  Standing (frozen) and
+        # field-gated samples are left out: there the magnetometer is known to
+        # be off and the gyro carries the heading.
+        used = (tt > t - p['drift_window_s']) & (r[:, 5] > 0.5)
         drift = None
-        if old_w.any():
-            drift = abs(float(wrap(d_now - circmean(d[old_w])))) * DEG
+        if used.sum() >= 3:
+            drift = abs(float(np.mean(r[used, 4]))) * DEG
             if drift >= p['max_gyro_drift_deg']:
                 reasons.append('gyro_drift')
-        if gyro_std is None or drift is None:
+        if gyro_std is None or self.f_W < 0.9 * p['fuse_init_s']:
             reasons.append('warmup')
-        vals = [yaw, d_now] + [x for x in (dF, dI, gyro_std, drift) if x is not None]
+        vals = [yaw, self.f_d, self.f_W] + [x for x in (dF, dI, gyro_std, drift) if x is not None]
         if not all(math.isfinite(x) for x in vals):
             out = {'t': t, 'state': 'disturbed', 'ok': False, 'reasons': ['invalid'], 'yaw': None}
             self.out = out
             return out
         ok = not reasons
+        sigma, rng, age = self._sigma(t, drift)
+        if not math.isfinite(sigma):
+            ok, reasons = False, reasons + ['invalid']
         out = {'t': t, 'state': 'ok' if ok else 'disturbed', 'ok': ok, 'reasons': reasons,
-               'yaw': yaw, 'sigma_deg': p['sigma_ok_deg'] if ok else None,
-               'dF_pct': dF, 'dIncl_deg': dI, 'gyro_std_deg': gyro_std, 'gyro_drift_deg': drift}
+               'yaw': yaw, 'sigma_deg': sigma if ok else None,
+               'correction_range_deg': rng, 'hold_age_s': age,
+               'dF_pct': dF, 'dIncl_deg': dI, 'gyro_std_deg': gyro_std, 'gyro_drift_deg': drift,
+               'fuse_tau_eff_s': self.f_W, 'frozen': self.frozen, 'moving': self.f_moving}
         ref = self.rtk_yaw(t)
         if ref is not None:
             err = float(wrap(yaw - ref)) * DEG
             out['rtk_err_deg'] = err
             self.last_err = (t, err, ok)
-            self.errors.append((t, abs(err), ok))
+            self.errors.append((t, abs(err), ok, self.f_moving))
         while self.errors and self.errors[0][0] < t - p['stats_window_s']:
             self.errors.popleft()
         self.out = out
@@ -717,12 +1108,22 @@ class MagHeadingEstimator(object):
                                hard_xy=p['hard_xy_pre_level'])
 
     def adopt(self, res, now):
-        self.last_fit = dict((k, v) for k, v in res.items() if k != 'cal')
+        """True when the calibration changed (and should be saved): a new one
+        was accepted, or the current one (from before the axis weighting) got
+        its residual covariance from these samples."""
+        self.last_fit = dict((k, v) for k, v in res.items() if k not in ('cal', 'current_cov'))
         self.last_fit['t'] = now
         if res['accepted']:
             self.set_calibration(res['cal'])
             self.cal_note = 'self-calibrated from RTK'
-        return res['accepted']
+            return True
+        if res.get('current_cov') is not None and self.cal is not None and self.cal.resid_cov is None:
+            self.cal.resid_cov = res['current_cov']
+            self.cal.version = CAL_VERSION
+            self._set_weights()
+            self.last_fit['axis_weights_added'] = True
+            return True
+        return False
 
     def fit(self, now):
         """Snapshot, fit, adopt: the whole step (tests, replay)."""
@@ -748,12 +1149,26 @@ class MagHeadingEstimator(object):
         s = {'state': state, 'reasons': reasons, 'source': p['source'],
              'yaw_deg': None, 'sigma_deg': None}
         if out is not None and out.get('yaw') is not None and state != 'stale':
-            s.update(yaw_deg=r2(out['yaw'] * DEG), sigma_deg=out['sigma_deg'],
+            s.update(yaw_deg=r2(out['yaw'] * DEG), sigma_deg=r2(out['sigma_deg']),
                      dF_pct=r2(out['dF_pct']), dIncl_deg=r2(out['dIncl_deg']),
                      gyro_std_deg=r2(out['gyro_std_deg']), gyro_drift_deg=r2(out['gyro_drift_deg']))
+        moving = self.moving(now)
+        fz = bool(p['freeze_standing'])
+        s['fusion'] = {
+            'tau_s': p['fuse_tau_s'], 'tau_eff_s': r2(self.f_W, 1),
+            'frozen': bool(self.frozen and state != 'stale'),
+            'correction_range_deg': r2(None if out is None else out.get('correction_range_deg')),
+            'hold_age_s': r2(None if out is None else out.get('hold_age_s'), 0),
+            'freeze_standing': fz,
+            'motion': 'unknown' if moving is None else ('moving' if moving else 'standing'),
+            'axis_weighting': bool(self.weighted),
+            'resets': self.resets, 'last_reset': self.reset_reason}
+        if fz and moving is None:
+            s['fusion']['note'] = 'no wheel odometry: running without the standing freeze'
         cal = self.cal
         if cal is not None:
             s['calibration'] = {
+                'version': cal.version,
                 'age_s': r2(time.time() - cal.created, 0) if cal.created else None,
                 'created': cal.to_dict()['created_iso'],
                 'center_uT': [r2(v) for v in cal.center], 'radii_uT': [r2(v) for v in cal.radii],
@@ -761,16 +1176,18 @@ class MagHeadingEstimator(object):
                 'offset_deg': r2(cal.offset * DEG), 'Fref_uT': r2(cal.Fref),
                 'Iref_deg': r2(None if cal.Iref is None else cal.Iref * DEG),
                 'resid_p50_deg': r2(cal.resid_p50_deg), 'resid_p90_deg': r2(cal.resid_p90_deg),
-                'best_p90_deg': r2(cal.best_p90_deg), 'bins': cal.bins, 'samples': cal.samples}
+                'best_p90_deg': r2(cal.best_p90_deg), 'bins': cal.bins, 'samples': cal.samples,
+                'axis_weights': None if not self.weighted else [[r2(v, 3) for v in row] for row in self.Q]}
         else:
             s['calibration'] = None
         if self.cal_note:
             s['calibration_note'] = self.cal_note
-        ref_ok = self.rtk_yaw(now) is not None
+        ref_ok, ref_reason = self.rtk_state(now)
         s['self_cal'] = {'enabled': bool(p['self_calibrate']), 'samples': self.bins.total(),
                          'bins_covered': self.bins.coverage(p['min_per_bin']), 'bins_needed': p['min_bins'],
                          'last_fit': self.last_fit}
-        cmp = {'rtk_valid': ref_ok, 'rtk_used': self.rtk_used, 'rtk_glitches': self.rtk_glitches,
+        cmp = {'rtk_valid': ref_ok, 'rtk_reason': ref_reason, 'rtk_require_fixed': bool(p['rtk_require_fixed']),
+               'rtk_used': self.rtk_used, 'rtk_glitches': self.rtk_glitches,
                'window_s': p['stats_window_s']}
         if self.last_err is not None and now - self.last_err[0] <= p['rtk_hold_s'] + 0.5:
             cmp['err_deg'] = r2(self.last_err[1])

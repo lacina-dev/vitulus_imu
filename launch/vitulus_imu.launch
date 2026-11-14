@@ -12,7 +12,13 @@
         <param name="mag_source" value="uncal"/>
         <param name="imu_topic" value="/bno085/imu"/>
         <param name="rtk_topic" value="/gnss_heading/navheading"/>
-        <param name="rtk_cov_max" value="0.01"/>
+        <param name="relpos_topic" value="/gnss_heading/navrelposned"/>
+        <param name="motion_topic" value="/mobile_base_controller/odom"/>
+        <param name="rtk_cov_min" value="0.00043"/>
+        <param name="rtk_cov_max" value="0.00079"/>
+        <param name="rtk_require_fixed" value="true"/>
+        <param name="fuse_tau_s" value="60.0"/>
+        <param name="freeze_standing" value="true"/>
         <param name="calibration_file" value="$(env HOME)/.ros/vitulus_imu/mag_calibration.yaml"/>
         <param name="self_calibrate" value="true"/>
         <param name="fit_interval_s" value="45.0"/>

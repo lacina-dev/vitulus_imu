@@ -10,3 +10,6 @@ __pycache__/
 *.swp
 *.swo
 *~
+.claude/
+__pycache__/
+*.pyc

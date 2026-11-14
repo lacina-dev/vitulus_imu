@@ -2,10 +2,17 @@
 """Absolute heading from the BNO085 magnetometer, with a trust gate and
 self-calibration from the RTK heading.  Navigation does not use it yet.
 
-  in  ~mag_topic   sensor_msgs/MagneticField (default /bno085/mag_uncal, tesla)
-      ~imu_topic   sensor_msgs/Imu game rotation vector (default /bno085/imu)
-      ~rtk_topic   sensor_msgs/Imu RTK heading (default /gnss_heading/navheading),
-                   valid when orientation_covariance[8] < ~rtk_cov_max
+  in  ~mag_topic    sensor_msgs/MagneticField (default /bno085/mag_uncal, tesla)
+      ~imu_topic    sensor_msgs/Imu game rotation vector (default /bno085/imu)
+      ~rtk_topic    sensor_msgs/Imu RTK heading (default /gnss_heading/navheading),
+                    a reference when orientation_covariance[8] is within
+                    ~rtk_cov_min..~rtk_cov_max and the last NAV-RELPOSNED says
+                    carrSoln FIXED + heading valid
+      ~relpos_topic ublox_msgs/NavRELPOSNED9 (default /gnss_heading/navrelposned);
+                    without it the RTK heading is not taken (~rtk_require_fixed)
+      ~motion_topic nav_msgs/Odometry wheel odometry (default
+                    /mobile_base_controller/odom): standing or moving; without
+                    it the correction is not frozen while standing
   out bno085/mag_heading         sensor_msgs/Imu, orientation = yaw only, in the
                                  convention of /gnss_heading/navheading;
                                  orientation_covariance[8] = sigma^2 when the
@@ -30,8 +37,14 @@ except ImportError:  # devel space without a rebuild: the source next to this fi
     from vitulus_imu.mag_heading import MagHeadingEstimator, load_calibration, save_calibration
 
 import rospy
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, MagneticField
 from std_msgs.msg import String
+
+try:
+    from ublox_msgs.msg import NavRELPOSNED9
+except ImportError:  # no ublox_msgs: the RTK heading cannot be checked for a full fix
+    NavRELPOSNED9 = None
 
 BIG = 1000.0
 
@@ -48,6 +61,8 @@ class MagHeadingNode(object):
         self.mag_topic = rospy.get_param('~mag_topic', '/bno085/mag_uncal')
         self.imu_topic = rospy.get_param('~imu_topic', '/bno085/imu')
         self.rtk_topic = rospy.get_param('~rtk_topic', '/gnss_heading/navheading')
+        self.relpos_topic = rospy.get_param('~relpos_topic', '/gnss_heading/navrelposned')
+        self.motion_topic = rospy.get_param('~motion_topic', '/mobile_base_controller/odom')
         self.frame_id = rospy.get_param('~frame_id', 'bno_imu_link')
         self.cal_file = os.path.expanduser(rospy.get_param(
             '~calibration_file', '~/.ros/vitulus_imu/mag_calibration.yaml'))
@@ -71,6 +86,14 @@ class MagHeadingNode(object):
         rospy.Subscriber(self.imu_topic, Imu, self.on_imu, queue_size=50, tcp_nodelay=True)
         rospy.Subscriber(self.mag_topic, MagneticField, self.on_mag, queue_size=50, tcp_nodelay=True)
         rospy.Subscriber(self.rtk_topic, Imu, self.on_rtk, queue_size=10, tcp_nodelay=True)
+        if NavRELPOSNED9 is not None:
+            rospy.Subscriber(self.relpos_topic, NavRELPOSNED9, self.on_relpos, queue_size=10,
+                             tcp_nodelay=True)
+        elif params['rtk_require_fixed']:
+            rospy.logwarn('mag_heading: ublox_msgs not available: the RTK heading is not used as '
+                          'reference (no self-calibration, no comparison)')
+        if self.motion_topic:
+            rospy.Subscriber(self.motion_topic, Odometry, self.on_motion, queue_size=20, tcp_nodelay=True)
         rospy.Timer(rospy.Duration(self.status_period_s), self.on_status)
         if params['self_calibrate']:
             rospy.Timer(rospy.Duration(self.fit_interval_s), self.on_fit)
@@ -83,22 +106,36 @@ class MagHeadingNode(object):
     def on_imu(self, msg):
         o = msg.orientation
         with self.lock:
-            self.est.on_imu(self.stamp(msg), o.x, o.y, o.z, o.w)
+            out = self.est.on_imu(self.stamp(msg), o.x, o.y, o.z, o.w, msg.angular_velocity.z)
+        self.publish(out)       # a magnetometer sample that waited for this IMU message
+
+    def on_relpos(self, msg):
+        # No header: the receive time; the driver publishes it right before the heading.
+        with self.lock:
+            self.est.on_relpos(rospy.get_time(), msg.flags)
 
     def on_rtk(self, msg):
         o = msg.orientation
         with self.lock:
-            self.est.on_rtk(self.stamp(msg), o.x, o.y, o.z, o.w, msg.orientation_covariance[8])
+            self.est.on_rtk(self.stamp(msg), o.x, o.y, o.z, o.w, msg.orientation_covariance[8],
+                            t_rx=rospy.get_time())
+
+    def on_motion(self, msg):
+        with self.lock:
+            self.est.on_motion(self.stamp(msg), msg.twist.twist.linear.x)
 
     def on_mag(self, msg):
         f = msg.magnetic_field
         with self.lock:
             out = self.est.on_mag(self.stamp(msg), f.x * 1e6, f.y * 1e6, f.z * 1e6)
+        self.publish(out)
+
+    def publish(self, out):
         if out is None or out.get('yaw') is None:
             return
         yaw = out['yaw']
         m = Imu()
-        m.header.stamp = msg.header.stamp
+        m.header.stamp = rospy.Time.from_sec(out['t'])      # time of the magnetometer sample
         m.header.frame_id = self.frame_id
         m.orientation.z = math.sin(yaw / 2.0)
         m.orientation.w = math.cos(yaw / 2.0)
@@ -130,12 +167,17 @@ class MagHeadingNode(object):
             with self.lock:
                 if self.est.cal is not current:
                     return
-                accepted = self.est.adopt(res, now)
-            if accepted:
+                changed = self.est.adopt(res, now)
+                cal = self.est.cal
+            if changed:
                 try:
-                    save_calibration(self.cal_file, res['cal'])
+                    save_calibration(self.cal_file, cal)
                 except (OSError, IOError) as exc:
                     rospy.logwarn_throttle(600, 'mag_heading: cannot save %s: %s' % (self.cal_file, exc))
+            if changed and not res['accepted']:
+                rospy.loginfo('mag_heading: axis weights added to the current calibration (new fit refused: %s)',
+                              res['reason'])
+            elif changed:
                 rospy.loginfo('mag_heading: calibration from RTK accepted: %d bins, %d samples, '
                               'residual p50 %.1f p90 %.1f deg (current p90 %s)',
                               res['coverage'], res['n'] - res['rejected'], res['p50_deg'], res['p90_deg'],
