@@ -41,6 +41,7 @@ def run(bag_path, topics, est, fit_interval, verbose, rows=None):
     t_fit = None
     n_mag = 0
     wanted = [v for v in topics.values() if v]
+    t0 = None
     def taken(t, out):
         if out is None:
             return
@@ -57,6 +58,8 @@ def run(bag_path, topics, est, fit_interval, verbose, rows=None):
             est.on_relpos(bt.to_sec(), m.flags)
             continue
         t = m.header.stamp.to_sec() or bt.to_sec()
+        if t0 is None:
+            t0 = t
         if topic == topics['imu']:
             o = m.orientation
             taken(t, est.on_imu(t, o.x, o.y, o.z, o.w, m.angular_velocity.z))
@@ -73,12 +76,22 @@ def run(bag_path, topics, est, fit_interval, verbose, rows=None):
                 t_fit = t
             if est.p['self_calibrate'] and t - t_fit >= fit_interval:
                 t_fit = t
+                before = (est.weighted, None if est.cal is None else est.cal.offset)
                 res = est.fit(t)
                 fits.append((t, res))
+                ref = res.get('refine')
                 if verbose:
                     print('  fit t=%7.1f  %-40s cover %2d  n %4d  rej %3d  p50 %s  p90 %s  current p90 %s' % (
                         t, res['reason'], res['coverage'], res['n'], res['rejected'], res['p50_deg'],
                         res['p90_deg'], res['current_p90_deg']))
+                    if ref is not None:
+                        print('      refine: %s | n %d bins %d p90 %s centre %s spread %s step %s | %s' % (
+                            ref['reason'], ref['n'] - ref['rejected'], ref['bins'], ref['p90_deg'],
+                            ref['centre_deg'], ref['spread_deg'], ref['step_deg'], ref['offset_reason']))
+                after = (est.weighted, None if est.cal is None else est.cal.offset)
+                if before != after:
+                    print('  CHANGE t=%7.1f (%.0f s into the bag): axis weighting %s, offset %s deg' % (
+                        t, t - t0, after[0], None if after[1] is None else round(after[1] * DEG, 2)))
     return states, fits, n_mag, reasons
 
 

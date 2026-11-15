@@ -41,6 +41,12 @@ Pipeline (all in the sensor frame bno_imu_link, field in microtesla):
      heading counts as a reference only with a full carrier fix
      (NAV-RELPOSNED carrSoln FIXED + heading valid) and a yaw variance in
      the healthy band, as in navi_transform.
+     When the directions are not covered (a robot that drives dock -> point
+     -> dock never heads some ways), the current calibration is refined on
+     the same samples instead, if it still fits them: the residual
+     covariance is added; with refine_offset (off by default) also the
+     offset is nudged (limited step, limited sum until the next full fit);
+     the ellipse and the hard iron stay.
 
 Yaw convention: the same as /gnss_heading/navheading (ENU, Euler 'ZYX' yaw of
 the orientation quaternion); the offset absorbs the mounting and the magnetic
@@ -171,7 +177,8 @@ class Calibration(object):
 
     def __init__(self, center, W, radii, offset=0.0, source='uncal', Fref=None, Iref=None,
                  resid_p50_deg=None, resid_p90_deg=None, bins=0, samples=0, created=None,
-                 hard=(0.0, 0.0, 0.0), best_p90_deg=None, resid_cov=None, version=CAL_VERSION):
+                 hard=(0.0, 0.0, 0.0), best_p90_deg=None, resid_cov=None, version=CAL_VERSION,
+                 refine=None):
         self.hard = np.asarray(hard, float).reshape(3)
         self.center = np.asarray(center, float).reshape(2)
         self.W = np.asarray(W, float).reshape(2, 2)
@@ -193,6 +200,21 @@ class Calibration(object):
         if resid_cov is not None and axis_information(resid_cov)[1]:
             self.resid_cov = np.asarray(resid_cov, float).reshape(2, 2)
         self.version = int(version)
+        # Refinements since the last full fit (refine_calibration): count, sum
+        # of the offset steps (deg), time of the last one, samples behind a
+        # matrix added by a refinement (None: the matrix is from a full fit).
+        self.refine = {'count': 0, 'offset_sum_deg': 0.0, 'last': None, 'cov_samples': None}
+        if isinstance(refine, dict):
+            try:
+                self.refine.update(count=int(refine.get('count') or 0),
+                                   offset_sum_deg=float(refine.get('offset_sum_deg') or 0.0),
+                                   last=None if refine.get('last') is None else float(refine['last']),
+                                   cov_samples=None if refine.get('cov_samples') is None
+                                   else int(refine['cov_samples']))
+            except (TypeError, ValueError):
+                pass
+            if not math.isfinite(self.refine['offset_sum_deg']):
+                self.refine['offset_sum_deg'] = 0.0
         self.check()
 
     def check(self):
@@ -248,6 +270,10 @@ class Calibration(object):
             'created': r(self.created, 1),
             'created_iso': datetime.datetime.fromtimestamp(self.created).isoformat(timespec='seconds')
             if self.created else None,
+            'refine': {'count': int(self.refine['count']),
+                       'offset_sum_deg': r(self.refine['offset_sum_deg'], 3),
+                       'last': r(self.refine['last'], 1),
+                       'cov_samples': self.refine['cov_samples']},
         }
 
     @classmethod
@@ -262,7 +288,7 @@ class Calibration(object):
                    d.get('resid_p50_deg'), d.get('resid_p90_deg'),
                    d.get('bins', 0), d.get('samples', 0), d.get('created'),
                    d.get('hard_uT') or (0.0, 0.0, 0.0), d.get('best_p90_deg'),
-                   d.get('resid_cov'), d.get('version'))
+                   d.get('resid_cov'), d.get('version'), d.get('refine'))
 
 
 def _file_version(path):
@@ -444,6 +470,11 @@ class SampleBins(object):
     def coverage(self, min_per_bin=1):
         return int(np.sum(self.count >= min_per_bin))
 
+    def missing(self, min_per_bin=1):
+        """Directions (RTK yaw, deg) with fewer than min_per_bin samples, as
+        [from, to] ranges; a range across +-180 has from > to."""
+        return missing_ranges(self.count >= min_per_bin)
+
     def total(self):
         return int(self.count.sum())
 
@@ -518,7 +549,7 @@ def _bin_medians(bl, bins, min_per_bin):
 
 def fit_calibration(snap, source, min_bins=30, min_per_bin=3, reject_dF_pct=12.0, reject_err_deg=20.0,
                     max_rejected=0.3, max_p90_deg=8.0, max_worse_deg=1.0, max_axis_ratio=3.0,
-                    current=None, now=0.0, hard_xy=False):
+                    current=None, now=0.0, hard_xy=False, n_bins=36):
     """Fit from SampleBins.snapshot(); dict with accepted, reason, cal, numbers.
 
     Three rounds: fit all -> drop odd field strength (dock, metal) -> fit, take
@@ -547,6 +578,8 @@ def fit_calibration(snap, source, min_bins=30, min_per_bin=3, reject_dF_pct=12.0
         res['coverage'] = len(pts)
         if len(pts) < min_bins:
             res['reason'] = 'coverage %d/%d bins' % (len(pts), min_bins)
+            res['missing_deg'] = missing_ranges(
+                np.bincount(bins[keep], minlength=n_bins)[:n_bins] >= min_per_bin)
             return res
         fit = fit_ellipse(pts)
         if fit is None:
@@ -616,6 +649,124 @@ def fit_calibration(snap, source, min_bins=30, min_per_bin=3, reject_dF_pct=12.0
         res['accepted'] = True
         res['reason'] = 'accepted'
     return res
+
+
+def missing_ranges(covered):
+    """covered: bool per bin (bin k = RTK yaw -180 + k w .. -180 + (k+1) w deg).
+    The uncovered bins as merged [from, to] ranges in deg; a range across
+    +-180 has from > to."""
+    covered = np.asarray(covered, bool)
+    n = len(covered)
+    if n == 0 or covered.all():
+        return []
+    w = 360.0 / n
+    if not covered.any():
+        return [[-180.0, 180.0]]
+    start = int(np.nonzero(covered)[0][0])
+    out, run = [], None
+    for i in range(1, n + 1):
+        k = (start + i) % n
+        if not covered[k]:
+            if run is None:
+                run = k
+            last = k
+        elif run is not None:
+            out.append([round(-180.0 + run * w, 1), round(-180.0 + (last + 1) * w, 1)])
+            run = None
+    return out
+
+
+def refine_calibration(snap, current, source, min_samples=100, min_bins=18, min_per_bin=3,
+                       reject_dF_pct=12.0, reject_err_deg=20.0, max_rejected=0.3, max_p90_deg=8.0,
+                       max_step_deg=2.0, max_total_deg=5.0, min_step_deg=0.3, max_spread_deg=3.0,
+                       offset=True):
+    """Refinement of the current calibration on samples that do not cover
+    enough directions for a full fit.  The ellipse and the hard iron stay;
+    on samples the calibration still fits (field strength and RTK outliers
+    dropped as in the full fit, residual p90 below max_p90_deg):
+      - the residual covariance for the axis weighting ('cov');
+      - an offset step: minus the median over the direction bins of the
+        per-bin median residual (each direction counts once, so a heading
+        that was driven longer does not pull it), only when it is clear:
+        >= min_bins directions, the bins agree (std <= max_spread_deg), the
+        centre is >= min_step_deg and >= 3 standard errors; at most
+        max_step_deg per step and the sum since the last full fit within
+        +-max_total_deg (then it waits for a full fit); kept only when the
+        residual p90 is not worse with it.  offset False: no step (the
+        estimator's refine_offset, off by default: a reference that is off
+        by a steady amount would be followed up to max_total_deg).
+    Returns a dict (JSON-able but for 'cov'): reason, n, bins, p50/p90 before
+    and after, centre, spread, step_deg (0: none), cov (None: none)."""
+    r = {'reason': '', 'n': int(len(snap['ref'])), 'bins': 0, 'rejected': 0, 'p50_deg': None,
+         'p90_deg': None, 'p90_after_deg': None, 'centre_deg': None, 'spread_deg': None,
+         'step_deg': 0.0, 'offset_reason': None, 'cov': None}
+    if current is None or current.source != source:
+        r['reason'] = 'no current calibration of this source'
+        return r
+    if r['n'] < min_samples:
+        r['reason'] = 'samples %d < %d' % (r['n'], min_samples)
+        return r
+    ref, bins = snap['ref'], snap['bin']
+    est = smoothed_raw(current, snap)
+    e = wrap(est + current.offset - ref) * DEG
+    keep = np.isfinite(e) & (np.abs(e) < reject_err_deg)
+    if current.Fref:
+        F = current.apply_raw(snap['b'], snap['L'])[1]
+        keep &= np.abs(F - current.Fref) / current.Fref * 100.0 < reject_dF_pct
+    r['rejected'] = int((~keep).sum())
+    if r['rejected'] > max_rejected * r['n']:
+        r['reason'] = 'rejected %.0f %% of samples > %.0f %%' % (100.0 * r['rejected'] / r['n'], 100 * max_rejected)
+        return r
+    ek = e[keep]
+    if len(ek) < min_samples:
+        r['reason'] = 'kept samples %d < %d' % (len(ek), min_samples)
+        return r
+    r['p50_deg'] = round(float(np.percentile(np.abs(ek), 50)), 2)
+    r['p90_deg'] = round(float(np.percentile(np.abs(ek), 90)), 2)
+    if r['p90_deg'] >= max_p90_deg:
+        r['reason'] = 'current calibration does not fit (p90 %.1f deg >= %.1f)' % (r['p90_deg'], max_p90_deg)
+        return r
+    bk = bins[keep]
+    med = np.array([np.median(ek[bk == b]) for b in np.unique(bk) if (bk == b).sum() >= min_per_bin])
+    r['bins'] = int(len(med))
+    if len(med) < min_bins:
+        r['reason'] = 'directions %d < %d' % (len(med), min_bins)
+        return r
+    r['cov'] = residual_cov(current, snap, keep, min_samples)
+    centre = float(np.median(med))
+    spread = float(np.std(med))
+    se = 1.2533 * spread / math.sqrt(len(med))      # standard error of a median
+    r['centre_deg'], r['spread_deg'] = round(centre, 3), round(spread, 3)
+    total = float(current.refine['offset_sum_deg'])
+    step = 0.0
+    if not offset:
+        r['offset_reason'] = 'offset refinement off (refine_offset)'
+    elif max_step_deg <= 0.0 or max_total_deg <= 0.0:
+        r['offset_reason'] = 'offset step limited to 0 (refine_max_step_deg / refine_max_total_deg)'
+    elif spread > max_spread_deg:
+        r['offset_reason'] = 'directions disagree (std %.1f deg > %.1f)' % (spread, max_spread_deg)
+    elif abs(centre) < max(min_step_deg, 3.0 * se):
+        r['offset_reason'] = 'offset within the noise (%.2f deg, standard error %.2f)' % (centre, se)
+    else:
+        step = float(np.clip(-centre, -max_step_deg, max_step_deg))
+        new_total = float(np.clip(total + step, -max_total_deg, max_total_deg))
+        step = new_total - total
+        if abs(step) < 1e-6:
+            r['offset_reason'] = 'offset refinements at the limit (%.1f deg since the last full fit): ' \
+                                 'waiting for a full fit' % total
+            step = 0.0
+    if step:
+        after = np.abs(ek + step)
+        p90a = float(np.percentile(after, 90))
+        r['p90_after_deg'] = round(p90a, 2)
+        if p90a > float(np.percentile(np.abs(ek), 90)):
+            r['offset_reason'] = 'offset step %.2f deg would not lower the residual p90' % step
+            step = 0.0
+        else:
+            r['offset_reason'] = 'offset step %.2f deg' % step
+    r['step_deg'] = round(step, 3)
+    r['reason'] = 'refined' if (step or r['cov'] is not None) else 'nothing to refine'
+    return r
 
 
 def summary(x):
@@ -707,6 +858,19 @@ class MagHeadingEstimator(object):
         'fit_max_p90_deg': 8.0,
         'fit_max_worse_deg': 1.0,
         'sample_max_age_s': 7 * 86400.0,   # older self-calibration samples are not used
+        # Refinement when a full fit lacks directions (refine_calibration);
+        # off: as before (nothing happens until min_bins are covered).
+        'refine_calibration': True,
+        # Offset step of the refinement: off, it follows a reference that is
+        # off by a steady amount (up to refine_max_total_deg) and has not been
+        # needed on the drives so far (the axis weights removed the bias).
+        'refine_offset': False,
+        'refine_min_samples': 100,    # 20 s of valid RTK at 5 Hz
+        'refine_min_bins': 18,        # directions with min_per_bin samples (half the circle)
+        'refine_max_step_deg': 2.0,   # offset step per refinement
+        'refine_max_total_deg': 5.0,  # sum of the steps until the next full fit
+        'refine_min_step_deg': 0.3,
+        'refine_max_spread_deg': 3.0, # std of the per-direction median residuals
         # Also subtract the horizontal hard iron before levelling (not only hz).
         # Off: on the 2026-11-08 bag it made F noisier and refused every fit.
         'hard_xy_pre_level': False,
@@ -1072,13 +1236,17 @@ class MagHeadingEstimator(object):
         return dev, max(0.0, dev - self.p['gyro_drift_deg_min'] * age / 60.0), age
 
     def _sigma(self, t, drift, dev):
-        """(sigma deg of an ok output, age of the last fused sample s)."""
+        """(sigma deg of an ok output, age of the last fused sample s).  The
+        offset steps of refinements since the last full fit are added in
+        full: the anchor follows RTK, so it cannot tell when they followed
+        a reference that was off."""
         p = self.p
         hold = 0.0 if self.f_used_t is None else max(0.0, t - self.f_used_t)
         confirmed = self.anc is not None and self.anc[2] == 'rtk'
         base = p['sigma_ok_deg'] if confirmed and self.f_W >= p['sigma_settle_s'] else p['sigma_start_deg']
+        refined = abs(self.cal.refine['offset_sum_deg']) if self.cal is not None else 0.0
         return max(base, p['sigma_k'] * (dev + (drift or 0.0))
-                   + p['gyro_drift_deg_min'] * hold / 60.0), hold
+                   + p['gyro_drift_deg_min'] * hold / 60.0) + refined, hold
 
     # -- output ---------------------------------------------------------------
 
@@ -1160,18 +1328,30 @@ class MagHeadingEstimator(object):
         min_t = None if self.t_mag is None else self.t_mag - self.p['sample_max_age_s']
         return self.bins.snapshot(min_t)
 
-    def fit_from(self, snap, now):
+    def fit_from(self, snap, now, current=None):
+        """Full fit; when it lacks directions, the refinement of the current
+        calibration (res['refine']).  current: the calibration to compare
+        with (default self.cal; the node passes the one of the snapshot)."""
         p = self.p
-        return fit_calibration(snap, p['source'], p['min_bins'], p['min_per_bin'],
-                               p['fit_reject_dF_pct'], p['fit_reject_err_deg'], p['fit_max_rejected'],
-                               p['fit_max_p90_deg'], p['fit_max_worse_deg'], current=self.cal, now=now,
-                               hard_xy=p['hard_xy_pre_level'])
+        cur = self.cal if current is None else current
+        res = fit_calibration(snap, p['source'], p['min_bins'], p['min_per_bin'],
+                              p['fit_reject_dF_pct'], p['fit_reject_err_deg'], p['fit_max_rejected'],
+                              p['fit_max_p90_deg'], p['fit_max_worse_deg'], current=cur, now=now,
+                              hard_xy=p['hard_xy_pre_level'], n_bins=p['n_bins'])
+        if p['refine_calibration'] and 'missing_deg' in res and cur is not None:
+            res['refine'] = refine_calibration(
+                snap, cur, p['source'], p['refine_min_samples'], p['refine_min_bins'], p['min_per_bin'],
+                p['fit_reject_dF_pct'], p['fit_reject_err_deg'], p['fit_max_rejected'], p['fit_max_p90_deg'],
+                p['refine_max_step_deg'], p['refine_max_total_deg'], p['refine_min_step_deg'],
+                p['refine_max_spread_deg'], p['refine_offset'])
+        return res
 
     def adopt(self, res, now):
         """True when the calibration changed (and should be saved): a new one
-        was accepted, or the current one (from before the axis weighting) got
-        its residual covariance from these samples."""
-        self.last_fit = dict((k, v) for k, v in res.items() if k not in ('cal', 'current_cov'))
+        was accepted, the current one (from before the axis weighting) got
+        its residual covariance from these samples, or it was refined
+        (matrix added / renewed, offset step)."""
+        self.last_fit = dict((k, v) for k, v in res.items() if k not in ('cal', 'current_cov', 'refine'))
         self.last_fit['t'] = now
         if res['accepted']:
             self.set_calibration(res['cal'])
@@ -1183,7 +1363,47 @@ class MagHeadingEstimator(object):
             self._set_weights()
             self.last_fit['axis_weights_added'] = True
             return True
-        return False
+        ref = res.get('refine')
+        if ref is None or self.cal is None:
+            return False
+        self.last_fit['refine'] = dict((k, v) for k, v in ref.items() if k != 'cov')
+        cal = self.cal
+        changed = False
+        cov = ref.get('cov')
+        # A matrix from a full fit stays; one from a refinement is renewed
+        # when it rests on clearly more samples (not a rewrite every fit).
+        prev_n = cal.refine.get('cov_samples')
+        if cov is not None and (cal.resid_cov is None or (prev_n is not None and ref['n'] - ref['rejected']
+                                                          >= 1.5 * prev_n)):
+            self.last_fit['axis_weights_added' if cal.resid_cov is None else 'axis_weights_refreshed'] = True
+            cal.resid_cov = np.asarray(cov, float).reshape(2, 2)
+            cal.refine['cov_samples'] = int(ref['n'] - ref['rejected'])
+            cal.version = CAL_VERSION
+            self._set_weights()
+            changed = True
+        if ref.get('step_deg'):
+            self._shift_offset(math.radians(ref['step_deg']))
+            cal.refine['offset_sum_deg'] = round(cal.refine['offset_sum_deg'] + ref['step_deg'], 3)
+            cal.version = CAL_VERSION
+            changed = True
+        if changed:
+            cal.refine['count'] += 1
+            cal.refine['last'] = float(now)
+            self.cal_note = 'refined from RTK (%d since the last full fit)' % cal.refine['count']
+        return changed
+
+    def _shift_offset(self, delta):
+        """offset += delta without a step of the output: the correction (and
+        its anchor) take -delta, so yaw = game yaw + correction + offset is
+        the same at this moment; the fusion then pulls the correction back
+        to what the magnetometer says within its window (fuse_tau_s), so the
+        heading moves to the new offset gradually.  The deviation from the
+        anchor and so sigma do not change at the moment of the shift."""
+        self.cal.offset = float(wrap(self.cal.offset + delta))
+        if self.f_d is not None:
+            self.f_d -= delta
+        if self.anc is not None:
+            self.anc = (self.anc[0] - delta, self.anc[1], self.anc[2])
 
     def fit(self, now):
         """Snapshot, fit, adopt: the whole step (tests, replay)."""
@@ -1239,6 +1459,7 @@ class MagHeadingEstimator(object):
                 'Iref_deg': r2(None if cal.Iref is None else cal.Iref * DEG),
                 'resid_p50_deg': r2(cal.resid_p50_deg), 'resid_p90_deg': r2(cal.resid_p90_deg),
                 'best_p90_deg': r2(cal.best_p90_deg), 'bins': cal.bins, 'samples': cal.samples,
+                'refine': cal.to_dict()['refine'],
                 'axis_weights': None if not self.weighted else [[r2(v, 3) for v in row] for row in self.Q]}
         else:
             s['calibration'] = None
@@ -1247,7 +1468,12 @@ class MagHeadingEstimator(object):
         ref_ok, ref_reason = self.rtk_state(now)
         s['self_cal'] = {'enabled': bool(p['self_calibrate']), 'samples': self.bins.total(),
                          'bins_covered': self.bins.coverage(p['min_per_bin']), 'bins_needed': p['min_bins'],
-                         'last_fit': self.last_fit}
+                         'last_fit': self.last_fit,
+                         'missing_deg': self.bins.missing(p['min_per_bin']),
+                         'refine_enabled': bool(p['refine_calibration']),
+                         'refinements': None if cal is None else int(cal.refine['count']),
+                         'offset_refined_deg': None if cal is None else r2(cal.refine['offset_sum_deg']),
+                         'axis_weighting': bool(self.weighted)}
         cmp = {'rtk_valid': ref_ok, 'rtk_reason': ref_reason, 'rtk_require_fixed': bool(p['rtk_require_fixed']),
                'rtk_used': self.rtk_used, 'rtk_glitches': self.rtk_glitches,
                'window_s': p['stats_window_s']}

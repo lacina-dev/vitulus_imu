@@ -186,6 +186,62 @@ heading is valid: `err_deg` (current error), and over the last
    `~calibration_file` (default `~/.ros/vitulus_imu/mag_calibration.yaml`)
    and loaded at start.  The file records the magnetometer `source`
    (`uncal` / `cal`): a calibration of another source is not used.
+7. **Refinement without full coverage** (`~refine_calibration`, on; off =
+   nothing happens until 30 bins are covered, as before).  A robot that
+   drives dock → point → dock never heads some ways (the 2026-11-15 nights:
+   27 of 36 bins over six drives, −120…−30° never), so the full fit above
+   never comes.  When a fit is refused for coverage, the current calibration
+   (same source) is checked on the same samples instead: samples with an
+   odd field strength (> 12 % off `Fref`) or > 20° off RTK are dropped (at
+   most 30 %), and it must still fit them (residual p90 < `~fit_max_p90_deg`,
+   8°), with ≥ `~refine_min_samples` (100, 20 s of valid RTK) samples in
+   ≥ `~refine_min_bins` (18, half the circle) bins of ≥ 3 samples.  Then:
+   - the **residual covariance** (axis weighting) is added to it when it has
+     none, or refreshed when the one it has came from a refinement on fewer
+     than 2/3 of the samples now at hand (a matrix from a full fit stays);
+   - only with `~refine_offset` (default **off**) the **offset** gets a step
+     = − median over the bins of the per-bin median residual (each direction
+     counts once), only when that is clear: the bins agree (std ≤
+     `~refine_max_spread_deg`, 3°), the centre is ≥ `~refine_min_step_deg`
+     (0.3°) and ≥ 3 standard errors, and the residual p90 is not worse with
+     the step.  One step is at most `~refine_max_step_deg` (2°), the sum of
+     the steps since the last full fit at most ±`~refine_max_total_deg`
+     (5°); then it waits for a full fit.  σ of every `ok` output is raised
+     by |sum of the steps|.
+   The ellipse and the hard iron are never changed by a refinement.
+   The reference is the same as for the full fit (full fix, variance band,
+   agrees with the gyro, settled), so a float or glitching RTK gives no
+   samples; repeated fits on the same samples do not add up (each one is
+   measured against the offset as it is now).  The file (version 2) records
+   `refine: {count, offset_sum_deg, last, cov_samples}`; a full fit starts
+   it again.  At the moment of an offset step the output does not jump: the
+   correction and its anchor take the opposite step, so the heading moves
+   to the new offset over the fusion window (`fuse_tau_s`, ~1 min; while
+   standing frozen, until it drives); the deviation from the anchor does
+   not change at that moment, σ grows by the step.
+   **A reference that is off by a steady amount** (an RTK antenna moved, a
+   wrong baseline for drive after drive) passes all the gates.  The matrix
+   only weights the two body axes and carries no direction, so it does not
+   follow such an error.  The offset step would: with RTK 6° off, steps of
+   +2, +2, +1° up to the 5° limit (error in `ok` 6–7°), and after the
+   reference is right again it comes back only a step per fit and only as
+   far as the evidence is clear (in a check, +2° were left after two wrong
+   and three right drives).  On the drives so far the step was never
+   needed (the axis weights removed the steady +1.5°), hence off by default.
+   Switching `~refine_calibration` off does not undo what was written (the
+   matrix and an offset step stay in the yaml): back = copy
+   `mag_calibration.v1.yaml` over it, or `~axis_weighting:=false` for the
+   matrix.
+   On the 2026-11-15 drives the axis weights alone removed the steady +1.5°
+   (the offset was within the noise, no step); see "Replay 2026-11-15".
+8. **Visibility.**  `status.self_cal` has `missing_deg` (directions of the
+   RTK yaw without enough samples, as `[from, to]` ranges in degrees, from >
+   to across ±180°), `refine_enabled`, `refinements` and
+   `offset_refined_deg` (since the last full fit), `axis_weighting`, and
+   `last_fit.refine` (the last refinement's numbers and reason).  A fit
+   refused for coverage is logged once per `~coverage_log_s` (30 min) with
+   the missing directions and what the refinement did; every change of the
+   calibration is logged (matrix added / refreshed, offset step).
 
 **RTK heading as reference** (self-calibration and `rtk_compare`): only with a
 full fix, as `navi_transform` does — the last NAV-RELPOSNED (received at most
@@ -207,9 +263,14 @@ comparison statistics include them.
 
 **Calibration file format.**  `version: 2` adds `resid_cov` (2×2, unit plane).
 Version 1 files (no matrix) load and behave as before the axis weighting
-(both axes the same); the first fit whose samples the old calibration still
-fits adds the matrix to it and rewrites the file, even when the new fit
-itself is refused.  A node from before version 2 refuses a version 2 file
+(both axes the same).  The matrix is added to it and the file rewritten
+(a) by a full fit that is refused (ratchet, worse than current) on samples
+the old calibration still fits, or (b) by a refinement (item 7) when the
+directions are not covered — the usual case; before 2026-11-15 case (b)
+did not exist and a coverage refusal returned before the matrix was
+computed, so a robot that never covers 30 bins stayed without it.  After
+an update the matrix comes once samples in 18 directions with valid RTK
+are at hand (on the 2026-11-15 drives: 12 min into the first drive).  A node from before version 2 refuses a version 2 file
 (`calibration version 2`, it starts `uncalibrated` and calibrates again from
 RTK).  For that case the version 1 file is copied to
 `mag_calibration.v1.yaml` next to it before the first version 2 write (once;
@@ -232,7 +293,10 @@ and every key of `MagHeadingEstimator.DEFAULTS` (`fuse_tau_s`,
 `max_gyro_std_deg`, `max_gyro_drift_deg`, `sigma_ok_deg`, `sigma_k`,
 `max_anchor_dev_deg`, `anchor_from_rtk`, `freeze_max_s`, `rtk_cov_min`,
 `rtk_cov_max`, `rtk_require_fixed`, `rtk_settle_s`, `self_calibrate`,
-`min_bins`, `fit_max_p90_deg`, ...).
+`min_bins`, `fit_max_p90_deg`, `refine_calibration`, `refine_min_samples`,
+`refine_min_bins`, `refine_max_step_deg`, `refine_max_total_deg`,
+`refine_min_step_deg`, `refine_max_spread_deg`, `refine_offset`, ...);
+node only: `coverage_log_s` (1800).
 
 ## Tools
 `tools/mag_replay.py BAG [--two-pass] [--cal-bag BAG2] [--mag-topic /bno085/mag --source cal]`
@@ -251,6 +315,30 @@ nice -n 10 python3 -m pytest test/test_mag_heading.py -q
 nice -n 10 python3 -m pytest test/test_bno085_mag_uncal.py -q
 nice -n 10 python3 test/test_bno085_recovery.py [--old-ref REF]
 ```
+
+## Replay 2026-11-15: refinement without full coverage
+
+The stored calibration of the robot (version 1, from 2026-11-14, offset
+−5.16°), the two night drives that have the raw magnetometer
+(`nav_baseline_2026-11-15_a`, then `nav_d1_2026-11-15_a`, the samples carried
+from one to the other as on the robot).  |error| against the single RTK
+messages (full fix, band, valid ≥ 5 s) in `ok`, median / p90 / max:
+
+| drive | before (no refinement) | with refinement |
+|---|---|---|
+| baseline_a (weights from 721 s on) | 1.41 / 2.18 / 4.51 | the same (no `ok` RTK after 721 s) |
+| d1 (weights from the start) | 1.77 / 2.61 / 5.12, mean +1.54 | 0.59 / 1.62 / 5.98, mean +0.04 |
+| baseline_a, the refined file | 1.41 / 2.18 / 4.51 | 0.44 / 0.99 / 3.41 (in-sample) |
+| magtest3 (2026-11-14, where the old file was made) | 1.09 / 2.36 / 4.75 | 0.88 / 2.05 / 4.57 |
+
+The share of `ok` does not change (72 / 77 / 83 %).  The refinement added
+the axis weights (380 samples in 18 directions) 721 s into the first drive
+and did not move the offset (centre +0.3…+0.85°, within 3 standard errors;
+the directions disagree by a std of 2.2–3°): the steady +1.5° of the nights
+came from the equal axes, not from the offset.  The larger maximum on d1
+is four RTK messages in the first 2 s of valid RTK of the drive where the error was
+already −4.3° and the removed +1.5° bias makes it −6°; the share above 4°
+went from 8 to 3 messages, p99 4.3 → 3.6°.
 
 ## Replay 2026-11-14: slow fusion against the first version
 

@@ -64,6 +64,8 @@ class MagHeadingNode(object):
         self.relpos_topic = rospy.get_param('~relpos_topic', '/gnss_heading/navrelposned')
         self.motion_topic = rospy.get_param('~motion_topic', '/mobile_base_controller/odom')
         self.frame_id = rospy.get_param('~frame_id', 'bno_imu_link')
+        self.coverage_log_s = float(rospy.get_param('~coverage_log_s', 1800.0))
+        self.last_coverage_log = -1e18
         self.cal_file = os.path.expanduser(rospy.get_param(
             '~calibration_file', '~/.ros/vitulus_imu/mag_calibration.yaml'))
         self.fit_interval_s = float(rospy.get_param('~fit_interval_s', 45.0))
@@ -163,7 +165,7 @@ class MagHeadingNode(object):
             if len(snap['ref']) == 0:
                 return
             now = time.time()
-            res = self.est.fit_from(snap, now)       # heavy part outside the lock
+            res = self.est.fit_from(snap, now, current)       # heavy part outside the lock
             with self.lock:
                 if self.est.cal is not current:
                     return
@@ -174,7 +176,24 @@ class MagHeadingNode(object):
                     save_calibration(self.cal_file, cal, warn=rospy.logwarn)
                 except (OSError, IOError) as exc:
                     rospy.logwarn_throttle(600, 'mag_heading: cannot save %s: %s' % (self.cal_file, exc))
-            if changed and not res['accepted']:
+            ref = res.get('refine')
+            if 'missing_deg' in res and time.time() - self.last_coverage_log >= self.coverage_log_s:
+                self.last_coverage_log = time.time()
+                rospy.loginfo('mag_heading: no full calibration fit: %s, directions without samples (RTK yaw, '
+                              'deg) %s; refinement of the current calibration: %s%s',
+                              res['reason'], res['missing_deg'],
+                              'off' if ref is None else ref['reason'],
+                              '' if ref is None or not ref.get('offset_reason') else ' (%s)' % ref['offset_reason'])
+            if changed and not res['accepted'] and ref is not None:
+                rospy.loginfo('mag_heading: current calibration refined on %d samples in %d directions '
+                              '(residual p90 %s deg): %s%s; offset %.2f deg, %d refinements, %.2f deg since '
+                              'the last full fit', ref['n'] - ref['rejected'], ref['bins'], ref['p90_deg'],
+                              'axis weights added' if self.est.last_fit.get('axis_weights_added')
+                              else 'axis weights refreshed' if self.est.last_fit.get('axis_weights_refreshed')
+                              else 'axis weights kept', '' if not ref['step_deg']
+                              else ', offset step %+.2f deg' % ref['step_deg'],
+                              math.degrees(cal.offset), cal.refine['count'], cal.refine['offset_sum_deg'])
+            elif changed and not res['accepted']:
                 rospy.loginfo('mag_heading: axis weights added to the current calibration (new fit refused: %s)',
                               res['reason'])
             elif changed:

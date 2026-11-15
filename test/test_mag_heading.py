@@ -1185,3 +1185,269 @@ def test_failed_copy_of_old_format_warns_and_saves(tmp_path, calibrated, monkeyp
     assert len(warned) == 1 and 'copy' in warned[0] and path in warned[0]
     assert yaml.safe_load(open(path))['version'] == 2
     mh.save_calibration(path, calibrated[0].cal)                   # without a warn function: silent, still saves
+
+
+# -- refinement without full coverage ----------------------------------------------
+
+def sweep(t):
+    """Back and forth over RTK yaw -25 .. 235 deg (27 of 36 directions; -120 .. -30
+    never), as dock -> point -> dock drives."""
+    return D(-25.0) + D(260.0) * (0.5 - 0.5 * math.cos(0.1 * t))
+
+
+def cal_copy(cal, offset_shift_deg=0.0, version=None):
+    d = cal.to_dict()
+    d['offset_deg'] += offset_shift_deg
+    if version == 1:
+        d['version'] = 1
+        del d['resid_cov']
+        del d['refine']
+    return mh.Calibration.from_dict(d)
+
+
+@pytest.fixture(scope='module')
+def swept():
+    """Samples of 160 s of the sweep (no calibration needed: the samples do not depend on it)."""
+    est = mh.MagHeadingEstimator(None, source='uncal')
+    simulate(est, 6000.0, 160.0, sweep, seed=41)
+    return est.fit_snapshot()
+
+
+def test_missing_ranges():
+    cov = np.ones(36, bool)
+    assert mh.missing_ranges(cov) == []
+    cov[5:14] = False
+    assert mh.missing_ranges(cov) == [[-130.0, -40.0]]
+    cov = np.ones(36, bool)
+    cov[[34, 35, 0]] = False
+    assert mh.missing_ranges(cov) == [[160.0, -170.0]]               # across +-180
+    cov = np.ones(36, bool)
+    cov[[3, 35]] = False
+    assert mh.missing_ranges(cov) == [[-150.0, -140.0], [170.0, 180.0]]
+    assert mh.missing_ranges(np.zeros(36, bool)) == [[-180.0, 180.0]]
+
+
+def test_partial_coverage_adds_axis_weights_to_v1_file(tmp_path, calibrated, swept):
+    """27 of 36 directions, a version 1 calibration that fits: the matrix is
+    added, the file becomes version 2 and the version 1 file is kept aside;
+    the ellipse and the hard iron do not change."""
+    import yaml
+    d = calibrated[0].cal.to_dict()
+    d['version'] = 1
+    del d['resid_cov'], d['refine']
+    path = str(tmp_path / 'mag_calibration.yaml')
+    with open(path, 'w') as fh:
+        yaml.safe_dump(d, fh)
+    original = open(path, 'rb').read()
+    cal, _ = mh.load_calibration(path, 'uncal')
+    assert cal.version == 1 and cal.resid_cov is None
+    e = mh.MagHeadingEstimator(cal, source='uncal')
+    centre, W, hard, offset = cal.center.copy(), cal.W.copy(), cal.hard.copy(), cal.offset
+    res = e.fit_from(swept, 6160.0)
+    assert not res['accepted'] and res['reason'] == 'coverage 27/30 bins', res['reason']
+    assert res['missing_deg'] == [[-120.0, -30.0]]
+    ref = res['refine']
+    assert ref['reason'] == 'refined' and ref['bins'] == 27 and ref['cov'] is not None, ref
+    assert e.adopt(res, 6160.0) is True
+    assert e.cal is cal and cal.version == 2 and cal.resid_cov is not None and e.weighted
+    assert np.array_equal(cal.center, centre) and np.array_equal(cal.W, W) and np.array_equal(cal.hard, hard)
+    assert cal.offset == offset and 'refine_offset' in ref['offset_reason']   # the step is off by default
+    assert e.last_fit['axis_weights_added'] and e.last_fit['refine']['reason'] == 'refined'
+    json.dumps(e.last_fit)
+    mh.save_calibration(path, cal)
+    assert sorted(os.listdir(str(tmp_path))) == ['mag_calibration.v1.yaml', 'mag_calibration.yaml']
+    assert open(str(tmp_path / 'mag_calibration.v1.yaml'), 'rb').read() == original
+    cal2, _ = mh.load_calibration(path, 'uncal')
+    assert cal2.version == 2 and np.allclose(cal2.resid_cov, cal.resid_cov, atol=1e-6)
+    assert cal2.refine['count'] == 1 and cal2.refine['cov_samples'] == ref['n'] - ref['rejected']
+    s = e.status(6160.0)
+    sc = s['self_cal']
+    assert sc['axis_weighting'] is True and sc['refinements'] == 1 and sc['refine_enabled'] is True
+    for key in ('enabled', 'samples', 'bins_covered', 'bins_needed', 'last_fit', 'missing_deg'):
+        assert key in sc, key
+    # The next fit on the same samples: nothing new to write.
+    res = e.fit_from(swept, 6205.0)
+    assert e.adopt(res, 6205.0) is False
+
+
+def test_refinement_switched_off_is_as_before(calibrated, swept):
+    cal = cal_copy(calibrated[0].cal, offset_shift_deg=1.5, version=1)
+    e = mh.MagHeadingEstimator(cal, source='uncal', refine_calibration=False)
+    res = e.fit_from(swept, 6160.0)
+    assert 'refine' not in res and e.adopt(res, 6160.0) is False
+    assert cal.resid_cov is None and cal.version == 1 and abs(cal.offset - cal_copy(
+        calibrated[0].cal, 1.5).offset) < 1e-12
+
+
+def test_refinement_removes_an_offset_without_a_step(calibrated):
+    """The calibration is 1.5 deg off: one refinement removes it; the output
+    does not jump at the moment (the correction takes the step and the
+    fusion moves the heading over within its window), the anchor is as
+    before and sigma grows by the step (it covers the refined offset).
+    The offset step is off by default (refine_offset)."""
+    cal = cal_copy(calibrated[0].cal, offset_shift_deg=1.5)
+    e = mh.MagHeadingEstimator(cal, source='uncal', refine_offset=True)
+    outs = simulate(e, 7000.0, 160.0, sweep, seed=42)
+    before = [(y, o) for t, y, o in outs if t > 7100.0 and o['ok']]
+    signed = np.array([mh.wrap(o['yaw'] - y) * mh.DEG for y, o in before])
+    assert 1.0 < np.median(signed) < 2.0, np.median(signed)
+    yaw0 = e.yaw_m + e.f_d + e.cal.offset
+    anc0, dev0 = e.anc, e._deviation(e.t_mag)[0]
+    res = e.fit(7160.0)
+    ref = res['refine']
+    assert ref['reason'] == 'refined' and -2.0 <= ref['step_deg'] < -1.0, ref
+    assert abs(math.degrees(e.cal.offset - cal_copy(calibrated[0].cal).offset) - 1.5 - ref['step_deg']) < 1e-6
+    assert abs(mh.wrap(e.yaw_m + e.f_d + e.cal.offset - yaw0)) < 1e-9       # no step of the output
+    assert e.anc[2] == anc0[2] and abs(e._deviation(e.t_mag)[0] - dev0) < 1e-9
+    assert e.cal.refine['count'] == 1 and abs(e.cal.refine['offset_sum_deg'] - ref['step_deg']) < 1e-9
+    outs = simulate(e, 7160.0, 240.0, sweep, seed=43)
+    steps = np.abs(np.diff([o['yaw'] for _, _, o in outs if o.get('yaw') is not None]))
+    rates = [abs(mh.wrap(a)) for a in steps]
+    assert max(rates) * mh.DEG < 3.0                                      # 0.1 s apart: only the turning
+    late = np.array([mh.wrap(o['yaw'] - y) * mh.DEG for t, y, o in outs if t > 7300.0 and o['ok']])
+    assert len(late) > 500 and abs(np.median(late)) < 0.5, np.median(late)
+    assert all(abs(o['sigma_deg'] - 4.0 - abs(ref['step_deg'])) < 1e-9 for t, _, o in outs if t > 7300.0 and o['ok'])
+    res = e.fit(7400.0)                                                     # converged: no further step
+    assert res['refine']['step_deg'] == 0.0 and e.cal.refine['count'] == 1, res['refine']
+
+
+def test_refinement_offset_step_and_limit(calibrated, swept):
+    cur = cal_copy(calibrated[0].cal, offset_shift_deg=4.0)
+    r = mh.refine_calibration(swept, cur, 'uncal')
+    assert r['step_deg'] == -2.0 and 3.0 < r['centre_deg'] < 5.0, r             # one step at most 2 deg
+    cur.refine['offset_sum_deg'] = -4.0
+    r = mh.refine_calibration(swept, cur, 'uncal')
+    assert r['step_deg'] == -1.0, r                                            # up to the limit of 5 deg
+    cur.refine['offset_sum_deg'] = -5.0
+    r = mh.refine_calibration(swept, cur, 'uncal')
+    assert r['step_deg'] == 0.0 and 'waiting for a full fit' in r['offset_reason'], r
+    assert r['cov'] is not None                                                # the matrix still comes
+    cur.refine['offset_sum_deg'] = 5.0                                         # other sign: room for 2
+    assert mh.refine_calibration(swept, cur, 'uncal')['step_deg'] == -2.0
+    r = mh.refine_calibration(swept, cur, 'uncal', max_step_deg=0.0)
+    assert r['step_deg'] == 0.0 and 'limited to 0' in r['offset_reason'], r
+    r = mh.refine_calibration(swept, cur, 'uncal', offset=False)
+    assert r['step_deg'] == 0.0 and 'off' in r['offset_reason'] and r['cov'] is not None, r
+    # A full fit starts the sum again: a new calibration has none.
+    assert mh.Calibration.from_dict(calibrated[0].cal.to_dict()).refine['offset_sum_deg'] == 0.0
+
+
+def test_refinement_does_not_follow_a_bad_reference(calibrated, swept):
+    cur = cal_copy(calibrated[0].cal)
+    # Direction-dependent error of the reference (+6 deg on one side, -2 on the other): no offset.
+    snap = dict(swept)
+    snap['ref'] = mh.wrap(swept['ref'] + np.where(swept['ref'] > D(100.0), D(6.0), D(-2.0)))
+    r = mh.refine_calibration(snap, cur, 'uncal')
+    assert r['step_deg'] == 0.0 and 'disagree' in r['offset_reason'], r
+    # Random +-15 deg: the current calibration does not fit these samples, nothing at all.
+    rng = np.random.default_rng(9)
+    snap['ref'] = mh.wrap(swept['ref'] + D(15.0) * rng.choice([-1.0, 1.0], len(swept['ref'])))
+    r = mh.refine_calibration(snap, cur, 'uncal')
+    assert r['step_deg'] == 0.0 and r['cov'] is None and r['reason'] != 'refined', r
+    # Too few samples / directions.
+    small = dict((k, v[:60]) for k, v in swept.items())
+    assert mh.refine_calibration(small, cur, 'uncal')['reason'].startswith('samples')
+    narrow = dict((k, v[swept['ref'] < D(60.0)]) for k, v in swept.items())
+    r = mh.refine_calibration(narrow, cur, 'uncal')
+    assert r['reason'].startswith('directions') and r['cov'] is None and r['step_deg'] == 0.0, r
+    # Another source: nothing.
+    assert mh.refine_calibration(swept, cur, 'cal')['reason'].startswith('no current')
+    # An RTK heading without a full fix gives no samples at all, so it cannot move the offset.
+    e = mh.MagHeadingEstimator(cal_copy(calibrated[0].cal, 3.0), source='uncal')
+    simulate(e, 8000.0, 60.0, sweep, seed=44, relpos=FLOAT)
+    res = e.fit(8060.0)
+    assert e.bins.total() == 0 and res['reason'] == 'no samples' and 'refine' not in res
+    assert e.cal.refine['count'] == 0
+
+
+def test_steady_reference_error_over_several_fits(calibrated, swept):
+    """The reference is 6 deg off for drive after drive.  Default (no offset
+    step): the offset does not move, only the axis weights come.  With
+    refine_offset: steps of at most 2 deg up to the limit of 5 deg, then
+    nothing; sigma grows by the refined sum, so the 5 deg stay covered."""
+    snap = dict(swept)
+    snap['ref'] = mh.wrap(swept['ref'] + D(6.0))
+    for on in (False, True):
+        cal = cal_copy(calibrated[0].cal, version=1)
+        offset = cal.offset
+        e = mh.MagHeadingEstimator(cal, source='uncal', refine_offset=on)
+        steps = []
+        for k in range(5):
+            res = e.fit_from(snap, 6200.0 + 45.0 * k)
+            e.adopt(res, 6200.0 + 45.0 * k)
+            steps.append(res['refine']['step_deg'])
+        assert cal.resid_cov is not None and e.weighted
+        if not on:
+            assert steps == [0.0] * 5 and cal.offset == offset and cal.refine['offset_sum_deg'] == 0.0
+        else:
+            assert steps[:3] == [2.0, 2.0, 1.0] and steps[3:] == [0.0, 0.0], steps
+            assert cal.refine['offset_sum_deg'] == 5.0
+            assert abs(math.degrees(cal.offset - offset) - 5.0) < 1e-6
+            assert 'waiting for a full fit' in res['refine']['offset_reason']
+            outs = simulate(e, 6300.0, 60.0, WOBBLE, seed=53)
+            oks = [o for t, _, o in outs if t > 6340.0 and o['ok']]
+            assert oks and all(o['sigma_deg'] >= 9.0 for o in oks)
+
+
+def test_node_fit_logs_coverage_once_and_refines(tmp_path, calibrated):
+    """on_fit of the node: a coverage refusal is logged once per
+    coverage_log_s with the missing directions; the refinement rewrites the
+    version 1 file as version 2 and keeps the version 1 copy."""
+    genpy = pytest.importorskip('genpy')
+    pytest.importorskip('sensor_msgs.msg')
+    pytest.importorskip('nav_msgs.msg')
+    import importlib.machinery
+    import importlib.util
+    import types
+    import yaml
+    d = calibrated[0].cal.to_dict()
+    d['version'] = 1
+    del d['resid_cov'], d['refine']
+    cal_file = str(tmp_path / 'mag_calibration.yaml')
+    with open(cal_file, 'w') as fh:
+        yaml.safe_dump(d, fh)
+    params = {'~calibration_file': cal_file}
+    log = []
+
+    class Time(genpy.Time):
+        @classmethod
+        def now(cls):
+            return cls.from_sec(6200.0)
+
+    rp = types.ModuleType('rospy')
+    rp.get_param = lambda name, default=None: params.get(name, default)
+    rp.Publisher = lambda topic, cls, **kw: types.SimpleNamespace(publish=lambda m: None)
+    rp.Subscriber = lambda topic, cls, cb, **kw: None
+    rp.Timer = lambda period, cb: None
+    rp.Duration = lambda s: s
+    rp.Time = Time
+    rp.get_time = lambda: 6200.0
+    for name in ('loginfo', 'logwarn', 'logerr', 'loginfo_throttle', 'logwarn_throttle'):
+        setattr(rp, name, lambda *a, **k: log.append(' '.join(str(x) for x in a)))
+    saved = sys.modules.get('rospy')
+    sys.modules['rospy'] = rp
+    try:
+        path = os.path.join(os.path.dirname(HERE), 'nodes', 'mag_heading')
+        loader = importlib.machinery.SourceFileLoader('mag_heading_node_fit', path)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        node = mod.MagHeadingNode()
+    finally:
+        if saved is None:
+            del sys.modules['rospy']
+        else:
+            sys.modules['rospy'] = saved
+    simulate(node.est, 6000.0, 160.0, sweep, seed=41)
+    del log[:]
+    node.on_fit(None)
+    cover = [x for x in log if 'no full calibration fit' in x]
+    assert len(cover) == 1 and '-120.0, -30.0' in cover[0] and 'refined' in cover[0], log
+    assert any('current calibration refined' in x and 'axis weights added' in x for x in log), log
+    assert yaml.safe_load(open(cal_file))['version'] == 2
+    assert os.path.exists(str(tmp_path / 'mag_calibration.v1.yaml'))
+    del log[:]
+    node.on_fit(None)                                             # within coverage_log_s: no second line
+    assert not [x for x in log if 'no full calibration fit' in x], log
+    node.last_coverage_log -= node.coverage_log_s
+    node.on_fit(None)
+    assert len([x for x in log if 'no full calibration fit' in x]) == 1, log
