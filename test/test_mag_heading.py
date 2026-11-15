@@ -427,6 +427,192 @@ def test_samples_expire():
     assert est.fit_snapshot()['t'].min() >= est.t_mag - 30.0
 
 
+# -- self-calibration samples on disk -----------------------------------------------
+
+def to_and_fro(t):
+    """Back and forth over RTK yaw -25 .. 235 deg (a part of the circle)."""
+    return D(-25.0) + D(260.0) * (0.5 - 0.5 * math.cos(0.1 * t))
+
+
+def test_samples_survive_a_restart(tmp_path):
+    path = str(tmp_path / 'sub' / 'mag_samples.npz')
+    e1 = mh.MagHeadingEstimator(None, source='uncal')
+    simulate(e1, 9000.0, 60.0, to_and_fro, seed=45)
+    n1 = e1.bins.total()
+    assert n1 > 150
+    mh.save_samples(path, e1.bins.state(), 'uncal', e1.t_mag)
+    assert os.listdir(str(tmp_path / 'sub')) == ['mag_samples.npz']     # no temporary file left
+    assert os.path.getsize(path) < 4e6
+    st, note = mh.load_samples(path, 'uncal')
+    assert st is not None, note
+    e2 = mh.MagHeadingEstimator(None, source='uncal')
+    assert e2.restore_samples(st, e1.t_mag + 3600.0) == n1
+    s1, s2 = e1.bins.snapshot(), e2.bins.snapshot()
+    o1, o2 = np.lexsort((s1['t'], s1['bin'])), np.lexsort((s2['t'], s2['bin']))
+    for k in ('b', 'L', 'win_b', 'win_L', 'win_dyaw', 'win_w', 'ref', 't', 'bin'):
+        assert np.array_equal(s1[k][o1], s2[k][o2]), k
+    # The collection goes on: more samples, the oldest replaced per bin as before.
+    simulate(e2, 9100.0, 100.0, to_and_fro, seed=46)
+    assert e2.bins.total() > n1 and e2.bins.count.max() == e2.p['per_bin']
+    res = e2.fit(e2.t_mag)
+    assert res['n'] == e2.bins.total() and res['reason'].startswith('coverage')
+    # Older than sample_max_age_s (7 days): not taken; a part of them only.
+    e3 = mh.MagHeadingEstimator(None, source='uncal')
+    assert e3.restore_samples(st, e1.t_mag + 8 * 86400.0) == 0 and e3.bins.last_restore['old'] == n1
+    e4 = mh.MagHeadingEstimator(None, source='uncal', sample_max_age_s=30.0)
+    k = e4.restore_samples(st, e1.t_mag)
+    assert 0 < k < n1 and e4.bins.snapshot()['t'].min() >= e1.t_mag - 30.0
+
+
+def test_samples_from_the_future_and_invalid_values(tmp_path):
+    """A clock set back by up to a few hours: the samples count as fresh;
+    further: left out and counted.  Non-finite values and an RTK yaw out of
+    range are left out."""
+    e1 = mh.MagHeadingEstimator(None, source='uncal')
+    simulate(e1, 9000.0, 30.0, to_and_fro, seed=54)
+    n1 = e1.bins.total()
+    st = e1.bins.state()
+    e2 = mh.MagHeadingEstimator(None, source='uncal')
+    assert e2.restore_samples(st, e1.t_mag - 2 * 3600.0) == n1                 # 2 h back: fresh
+    assert e2.restore_samples(st, e1.t_mag - 10 * 3600.0) == 0                 # 10 h back: left out
+    assert e2.bins.last_restore['future'] == n1
+    filled = np.argwhere(np.arange(e1.p['per_bin'])[None, :] < st['count'][:, None])
+    (k0, j0), (k1, j1), (k2, j2) = filled[0], filled[1], filled[2]
+    st['ref'][k0, j0] = float('nan')
+    st['win_L'][k1, j1, 3, 4] = float('inf')
+    st['ref'][k2, j2] = 4.0                                                    # > pi
+    assert e2.restore_samples(st, e1.t_mag) == n1 - 3
+    assert e2.bins.last_restore['invalid'] == 3
+    assert np.all(np.isfinite(e2.bins.snapshot()['win_L']))
+
+
+def test_foreign_old_and_broken_samples_files(tmp_path):
+    e1 = mh.MagHeadingEstimator(None, source='uncal')
+    simulate(e1, 9000.0, 20.0, to_and_fro, seed=47)
+    path = str(tmp_path / 'mag_samples.npz')
+    mh.save_samples(path, e1.bins.state(), 'cal', e1.t_mag)
+    st, note = mh.load_samples(path, 'uncal')
+    assert st is None and 'source' in note
+    with open(path, 'wb') as fh:
+        np.savez_compressed(fh, version=np.array(99), source=np.array('uncal'), **e1.bins.state())
+    st, note = mh.load_samples(path, 'uncal')
+    assert st is None and 'format' in note
+    with open(path, 'wb') as fh:
+        fh.write(b'PK\x03\x04 not a zip at all')
+    st, note = mh.load_samples(path, 'uncal')
+    assert st is None and 'unreadable' in note
+    st, note = mh.load_samples(str(tmp_path / 'none.npz'), 'uncal')
+    assert st is None and 'no samples file' in note
+    # Another layout (n_bins): refused, the estimator stays empty and works.
+    mh.save_samples(path, e1.bins.state(), 'uncal', e1.t_mag)
+    st, _ = mh.load_samples(path, 'uncal')
+    e2 = mh.MagHeadingEstimator(None, source='uncal', n_bins=24)
+    with pytest.raises(ValueError):
+        e2.restore_samples(st, e1.t_mag)
+    assert e2.bins.total() == 0
+    simulate(e2, 9100.0, 10.0, to_and_fro, seed=48)
+    assert e2.bins.total() > 0
+    st['count'][0] = 99                                               # out of range
+    with pytest.raises(ValueError):
+        mh.MagHeadingEstimator(None, source='uncal').restore_samples(st, e1.t_mag)
+
+
+def test_samples_disk_error_does_not_raise(tmp_path):
+    e1 = mh.MagHeadingEstimator(None, source='uncal')
+    simulate(e1, 9000.0, 10.0, to_and_fro, seed=49)
+    blocker = tmp_path / 'file'
+    blocker.write_text('x')
+    warned = []
+    assert mh.try_save_samples(str(blocker / 'mag_samples.npz'), e1.bins.state(), 'uncal', 1.0,
+                               warn=warned.append) is False
+    assert len(warned) == 1 and 'cannot save' in warned[0]
+    ro = tmp_path / 'ro'
+    ro.mkdir()
+    os.chmod(str(ro), 0o500)
+    try:
+        if not os.access(str(ro), os.W_OK):                           # not as root
+            assert mh.try_save_samples(str(ro / 'mag_samples.npz'), e1.bins.state(), 'uncal', 1.0) is False
+            assert os.listdir(str(ro)) == []
+    finally:
+        os.chmod(str(ro), 0o700)
+
+
+def samples_node(params, t0=0.0):
+    """nodes/mag_heading with a stand-in rospy, ROS time t0: (node, clock, log)."""
+    import importlib.machinery
+    import importlib.util
+    import types
+    genpy = pytest.importorskip('genpy')
+    pytest.importorskip('sensor_msgs.msg')
+    pytest.importorskip('nav_msgs.msg')
+    clock = {'t': t0}
+    log = []
+
+    class Time(genpy.Time):
+        @classmethod
+        def now(cls):
+            return cls.from_sec(clock['t'])
+
+    rp = types.ModuleType('rospy')
+    rp.get_param = lambda name, default=None: params.get(name, default)
+    rp.Publisher = lambda topic, cls, **kw: types.SimpleNamespace(publish=lambda m: None)
+    rp.Subscriber = lambda topic, cls, cb, **kw: None
+    rp.Timer = lambda period, cb: None
+    rp.Duration = lambda s: s
+    rp.Time = Time
+    rp.get_time = lambda: clock['t']
+    for name in ('loginfo', 'logwarn', 'logerr', 'loginfo_throttle', 'logwarn_throttle'):
+        setattr(rp, name, lambda *a, **k: log.append(a))
+    saved = sys.modules.get('rospy')
+    sys.modules['rospy'] = rp
+    try:
+        path = os.path.join(os.path.dirname(HERE), 'nodes', 'mag_heading')
+        loader = importlib.machinery.SourceFileLoader('mag_heading_node_samples', path)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        node = mod.MagHeadingNode()
+    finally:
+        if saved is None:
+            del sys.modules['rospy']
+        else:
+            sys.modules['rospy'] = saved
+    return node, clock, log
+
+
+def test_node_keeps_samples_across_a_restart(tmp_path, calibrated):
+    cal_file = str(tmp_path / 'mag_calibration.yaml')
+    mh.save_calibration(cal_file, calibrated[0].cal)
+    node, clock, _ = samples_node({'~calibration_file': cal_file})
+    assert node.samples_file == str(tmp_path / 'mag_samples.npz')
+    simulate(node.est, 9000.0, 30.0, to_and_fro, seed=50)
+    clock['t'] = 9030.0
+    assert node.save_samples() is True and os.path.exists(node.samples_file)
+    assert node.save_samples() is False                              # nothing new: no write
+    n = node.est.bins.total()
+    node2, _, _ = samples_node({'~calibration_file': cal_file}, t0=9100.0)
+    assert node2.est.bins.total() == n and 'samples' in node2.samples_note
+    # ROS time far before the samples (clock set back by a day): left out, a warning.
+    node2b, _, log2b = samples_node({'~calibration_file': cal_file}, t0=9030.0 - 86400.0)
+    assert node2b.est.bins.total() == 0 and 'future' in node2b.samples_note
+    assert any('future' in str(a) for a in log2b)
+    # A broken file: the node starts empty and says so.
+    with open(node.samples_file, 'wb') as fh:
+        fh.write(b'garbage')
+    node3, _, _ = samples_node({'~calibration_file': cal_file})
+    assert node3.est.bins.total() == 0 and 'unreadable' in node3.samples_note
+    # A disk that cannot be written: no exception, a warning.
+    blocker = tmp_path / 'file'
+    blocker.write_text('x')
+    node4, _, log4 = samples_node({'~calibration_file': cal_file, '~samples_file': str(blocker / 's.npz')})
+    simulate(node4.est, 9000.0, 10.0, to_and_fro, seed=51)
+    assert node4.save_samples() is False and any('cannot save' in str(a) for a in log4)
+    node4.on_save_samples()
+    # Off: nothing on disk.
+    node5, _, _ = samples_node({'~calibration_file': cal_file, '~samples_file': ''})
+    simulate(node5.est, 9000.0, 10.0, to_and_fro, seed=52)
+    assert node5.save_samples() is False and node5.samples_file == ''
+
+
 def test_hard_xy_pre_level_option():
     est = mh.MagHeadingEstimator(None, source='uncal', hard_xy_pre_level=True)
     simulate(est, 0.0, 80.0, spin(), tilt_deg=(4.0, 3.0), hard=np.array([28.0, 32.0, 30.0]))

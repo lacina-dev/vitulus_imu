@@ -65,6 +65,8 @@ TWO_PI = 2.0 * math.pi
 DEG = 180.0 / math.pi
 CAL_VERSION = 2            # 2: resid_cov (axis weighting); version 1 files load without it
 CAL_VERSIONS = (1, 2)
+SAMPLES_VERSION = 1        # format of the self-calibration samples file
+SAMPLES_FUTURE_S = 6 * 3600.0   # restored samples up to this far after now (clock set back) count as fresh
 
 
 def wrap(a):
@@ -427,6 +429,8 @@ class SampleBins(object):
     A sample: the raw field and R_level, the window of the last smooth_s (raw
     field, R_level, game-yaw change up to now: for the smoothed residual), the
     RTK yaw (carried by the gyro to the sample time) and its time.
+    state() / restore() with save_samples / load_samples keep them on disk,
+    so a restart of the node does not start the collection again.
     """
 
     def __init__(self, n_bins=36, per_bin=40, window_k=20):
@@ -441,6 +445,65 @@ class SampleBins(object):
         self.t = np.zeros((n_bins, per_bin))
         self.count = np.zeros(n_bins, int)
         self.next = np.zeros(n_bins, int)
+        self.added = 0           # samples added or restored so far (changed since the last save?)
+        self.last_restore = None
+
+    ARRAYS = ('b', 'L', 'win_b', 'win_L', 'win_dyaw', 'win_w', 'ref', 't', 'count', 'next')
+
+    def state(self):
+        """Copies of all arrays (for save_samples; cheap enough under a lock)."""
+        return dict((k, getattr(self, k).copy()) for k in self.ARRAYS)
+
+    def restore(self, st, min_t=-np.inf, max_t=np.inf):
+        """Takes the samples of state() with min_t <= t <= max_t, oldest first
+        per bin (the rings are compacted); samples with a non-finite value or
+        an RTK yaw outside -pi..pi are left out.  self.last_restore counts
+        taken / old / future / invalid.  Returns how many were taken.  Raises ValueError
+        when the arrays do not match this layout."""
+        nb, pb, k = self.n_bins, self.per_bin, self.k
+        shapes = {'b': (nb, pb, 3), 'L': (nb, pb, 9), 'win_b': (nb, pb, k, 3), 'win_L': (nb, pb, k, 9),
+                  'win_dyaw': (nb, pb, k), 'win_w': (nb, pb, k), 'ref': (nb, pb), 't': (nb, pb),
+                  'count': (nb,), 'next': (nb,)}
+        for name, shape in shapes.items():
+            if name not in st or tuple(np.shape(st[name])) != shape:
+                raise ValueError('samples: %s has shape %s, expected %s' % (
+                    name, None if name not in st else tuple(np.shape(st[name])), shape))
+        count = np.asarray(st['count'], int)
+        nxt = np.asarray(st['next'], int)
+        if np.any(count < 0) or np.any(count > pb) or np.any(nxt < 0) or np.any(nxt >= pb):
+            raise ValueError('samples: count / next out of range')
+        vals = ('b', 'L', 'win_b', 'win_L', 'win_dyaw', 'win_w', 'ref', 't')
+        valid = np.ones((nb, pb), bool)
+        for name in vals:
+            a = np.asarray(st[name], float)
+            valid &= np.all(np.isfinite(a.reshape(nb, pb, -1)), axis=2)
+        with np.errstate(invalid='ignore'):
+            valid &= np.abs(np.asarray(st['ref'], float)) <= math.pi + 1e-9
+        self.clear()
+        info = {'taken': 0, 'old': 0, 'future': 0, 'invalid': 0}
+        for kb in range(nb):
+            n = int(count[kb])
+            order = np.arange(n) if n < pb else (np.arange(pb) + int(nxt[kb])) % pb
+            src = []
+            for j in order:
+                t = st['t'][kb, j]
+                if not valid[kb, j]:
+                    info['invalid'] += 1
+                elif t < min_t:
+                    info['old'] += 1
+                elif t > max_t:
+                    info['future'] += 1
+                else:
+                    src.append(j)
+            for i, j in enumerate(src):
+                for name in vals:
+                    getattr(self, name)[kb, i] = st[name][kb, j]
+            self.count[kb] = len(src)
+            self.next[kb] = len(src) % pb
+            info['taken'] += len(src)
+        self.added += info['taken']
+        self.last_restore = info
+        return info['taken']
 
     def bin_of(self, yaw):
         return int(((wrap(yaw) + math.pi) / TWO_PI) * self.n_bins) % self.n_bins
@@ -462,6 +525,7 @@ class SampleBins(object):
         self.t[k, j] = t
         self.next[k] = (j + 1) % self.per_bin
         self.count[k] = min(self.count[k] + 1, self.per_bin)
+        self.added += 1
 
     def clear(self):
         self.count[:] = 0
@@ -488,6 +552,59 @@ class SampleBins(object):
                 'win_dyaw': self.win_dyaw[mask].copy(), 'win_w': self.win_w[mask].copy(),
                 'ref': self.ref[mask].copy(), 't': self.t[mask].copy(),
                 'bin': np.nonzero(mask)[0]}
+
+
+def save_samples(path, state, source, now):
+    """Writes SampleBins.state() atomically (temporary file + fsync + rename)
+    as a compressed .npz with the format version, the source and the time."""
+    path = os.path.expanduser(path)
+    folder = os.path.dirname(path) or '.'
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.mag_samples_', suffix='.npz', dir=folder)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            np.savez_compressed(fh, version=np.array(SAMPLES_VERSION), source=np.array(str(source)),
+                                saved=np.array(float(now)), **state)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def try_save_samples(path, state, source, now, warn=None):
+    """save_samples that never raises: False and warn(text) on any error."""
+    try:
+        save_samples(path, state, source, now)
+        return True
+    except Exception as exc:  # noqa: BLE001 - a full or read-only disk must not stop the node
+        if warn is not None:
+            warn('mag_heading: cannot save the self-calibration samples to %s: %r' % (path, exc))
+        return False
+
+
+def load_samples(path, source):
+    """(state dict or None, note).  Refused: absent, unreadable, another
+    format version, another magnetometer source."""
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        return None, 'no samples file %s' % path
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            version = int(z['version'])
+            src = str(z['source'])
+            if version != SAMPLES_VERSION:
+                return None, 'samples file %s has format %d, not %d: not used' % (path, version, SAMPLES_VERSION)
+            if src != source:
+                return None, 'samples file %s is for source %r, not %r: not used' % (path, src, source)
+            st = dict((k, np.array(z[k])) for k in SampleBins.ARRAYS)
+    except Exception as exc:  # noqa: BLE001 - a broken file means no samples
+        return None, 'samples file %s unreadable (%r): starting empty' % (path, exc)
+    return st, 'samples from %s' % path
 
 
 def smoothed_raw(cal, snap):
@@ -1114,6 +1231,19 @@ class MagHeadingEstimator(object):
         if len(w) > k:
             w = w[np.linspace(0, len(w) - 1, k).round().astype(int)]
         self.bins.add(t, b, self.level, w[:, 1:4], w[:, 4:13], self.yaw_m - w[:, 13], ref)
+
+    def restore_samples(self, state, now):
+        """Self-calibration samples from load_samples(): those not older than
+        sample_max_age_s and not more than SAMPLES_FUTURE_S (6 h, a clock set
+        back) after now; further in the future they are left out
+        (self.bins.last_restore['future']).  Returns how many were taken;
+        raises ValueError on a layout mismatch (the samples are then left
+        empty)."""
+        try:
+            return self.bins.restore(state, now - self.p['sample_max_age_s'], now + SAMPLES_FUTURE_S)
+        except ValueError:
+            self.bins.clear()
+            raise
 
     # -- fusion with the gyro ---------------------------------------------------
 

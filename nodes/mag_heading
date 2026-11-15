@@ -19,6 +19,10 @@ self-calibration from the RTK heading.  Navigation does not use it yet.
                                  gate says ok, 1e3 otherwise; only with a
                                  calibration
       bno085/mag_heading/status  std_msgs/String JSON, latched, 1 Hz
+  files ~calibration_file  (default ~/.ros/vitulus_imu/mag_calibration.yaml)
+        ~samples_file      self-calibration samples (default mag_samples.npz next
+                           to the calibration; '' = kept in memory only), written
+                           at most every ~samples_save_s (60 s) and at shutdown
 
 The logic lives in vitulus_imu.mag_heading; README.md describes states and
 parameters.
@@ -31,10 +35,12 @@ import threading
 import time
 
 try:
-    from vitulus_imu.mag_heading import MagHeadingEstimator, load_calibration, save_calibration
+    from vitulus_imu.mag_heading import (SAMPLES_FUTURE_S, MagHeadingEstimator, load_calibration,
+                                         load_samples, save_calibration, try_save_samples)
 except ImportError:  # devel space without a rebuild: the source next to this file
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
-    from vitulus_imu.mag_heading import MagHeadingEstimator, load_calibration, save_calibration
+    from vitulus_imu.mag_heading import (SAMPLES_FUTURE_S, MagHeadingEstimator, load_calibration,
+                                         load_samples, save_calibration, try_save_samples)
 
 import rospy
 from nav_msgs.msg import Odometry
@@ -70,6 +76,13 @@ class MagHeadingNode(object):
             '~calibration_file', '~/.ros/vitulus_imu/mag_calibration.yaml'))
         self.fit_interval_s = float(rospy.get_param('~fit_interval_s', 45.0))
         self.status_period_s = float(rospy.get_param('~status_period_s', 1.0))
+        samples_file = rospy.get_param('~samples_file', None)
+        if samples_file is None:
+            samples_file = os.path.join(os.path.dirname(self.cal_file), 'mag_samples.npz')
+        self.samples_file = os.path.expanduser(samples_file) if samples_file else ''
+        self.samples_save_s = float(rospy.get_param('~samples_save_s', 60.0))
+        self.saved_added = 0
+        self.save_lock = threading.Lock()        # one writer of the samples file at a time
 
         self.lock = threading.Lock()
         self.est = MagHeadingEstimator(None, **params)
@@ -82,6 +95,9 @@ class MagHeadingNode(object):
             rospy.logwarn('mag_heading: %s; waiting for self-calibration from RTK', note)
         self.est.cal_note = note
         self.fitting = False
+        self.samples_note = 'samples kept in memory only' if not self.samples_file else None
+        if self.samples_file and params['self_calibrate']:
+            self.load_samples(params['source'])
 
         self.pub = rospy.Publisher('bno085/mag_heading', Imu, queue_size=10)
         self.status_pub = rospy.Publisher('bno085/mag_heading/status', String, queue_size=1, latch=True)
@@ -99,6 +115,62 @@ class MagHeadingNode(object):
         rospy.Timer(rospy.Duration(self.status_period_s), self.on_status)
         if params['self_calibrate']:
             rospy.Timer(rospy.Duration(self.fit_interval_s), self.on_fit)
+            if self.samples_file:
+                rospy.Timer(rospy.Duration(self.samples_save_s), self.on_save_samples)
+
+    def load_samples(self, source):
+        st, note = load_samples(self.samples_file, source)
+        if st is None:
+            self.samples_note = note
+            if 'unreadable' in note or 'not used' in note:
+                rospy.logwarn('mag_heading: %s', note)
+            else:
+                rospy.loginfo('mag_heading: %s', note)
+            return
+        now = rospy.get_time() or time.time()
+        try:
+            n = self.est.restore_samples(st, now)
+        except ValueError as exc:
+            self.samples_note = 'samples file %s does not match (%s): starting empty' % (self.samples_file, exc)
+            rospy.logwarn('mag_heading: %s', self.samples_note)
+            return
+        self.saved_added = self.est.bins.added
+        info = self.est.bins.last_restore
+        self.samples_note = '%s: %d samples, %d bins' % (note, n, self.est.bins.coverage(self.est.p['min_per_bin']))
+        left = ', '.join('%d %s' % (info[k], k) for k in ('old', 'future', 'invalid') if info[k])
+        if left:
+            self.samples_note += ' (left out: %s)' % left
+        if info['future'] or info['invalid']:
+            rospy.logwarn('mag_heading: %s; "future" = more than %.0f h after now (clock set back?)',
+                          self.samples_note, SAMPLES_FUTURE_S / 3600.0)
+        else:
+            rospy.loginfo('mag_heading: %s', self.samples_note)
+
+    def save_samples(self, _event=None):
+        """Writes the samples when new ones came since the last write: the
+        copy under the estimator lock (~3.4 MB of memcpy, milliseconds), the compression
+        and the write outside it (this runs in a timer thread, not in the
+        message callbacks).  Never raises."""
+        if not self.samples_file:
+            return False
+        with self.save_lock:
+            with self.lock:
+                added = self.est.bins.added
+                if added == self.saved_added:
+                    return False
+                st = self.est.bins.state()
+            now = rospy.get_time() or time.time()
+            ok = try_save_samples(self.samples_file, st, self.est.p['source'], now,
+                                  warn=lambda text: rospy.logwarn_throttle(600, text))
+            if ok:
+                self.saved_added = added
+            return ok
+
+    def on_save_samples(self, event=None):
+        try:
+            self.save_samples(event)
+        except Exception as exc:  # noqa: BLE001 - saving must never stop the node
+            rospy.logwarn_throttle(600, 'mag_heading: saving the samples failed: %r' % exc)
 
     @staticmethod
     def stamp(msg):
@@ -152,6 +224,8 @@ class MagHeadingNode(object):
             s = self.est.status(rospy.Time.now().to_sec())
         s['calibration_file'] = self.cal_file
         s['mag_topic'] = self.mag_topic
+        s['self_cal']['samples_file'] = self.samples_file or None
+        s['self_cal']['samples_note'] = self.samples_note
         self.status_pub.publish(String(json.dumps(s)))
 
     def on_fit(self, _event):
@@ -211,5 +285,6 @@ class MagHeadingNode(object):
 
 if __name__ == '__main__':
     rospy.init_node('mag_heading')
-    MagHeadingNode()
+    node = MagHeadingNode()
+    rospy.on_shutdown(node.on_save_samples)          # the samples since the last timer write
     rospy.spin()

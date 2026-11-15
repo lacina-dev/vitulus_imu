@@ -283,7 +283,24 @@ published as a heading (`reasons: ["invalid"]`).  Files without `hard_uT`
 load with h = 0.
 
 A new robot (no file) is `uncalibrated` until it has turned through ≥ 30 of
-36 directions with RTK, e.g. a slow turn on the spot or two.
+36 directions with RTK, e.g. a slow turn on the spot or two (the directions
+add up over drives and restarts, the samples are on disk).
+
+**Samples on disk.**  The self-calibration samples (36 × 40 with their
+1 s window; compressed ~0.7 kB per sample, at most ~1 MB) are written to
+`~samples_file` (default `mag_samples.npz` next to the calibration; `''` =
+memory only) atomically, at most every `~samples_save_s` (60 s) when there
+are new ones, and at shutdown; the copy is taken under the lock, the
+compression and the write in the timer thread, and a write error is a
+warning (once per 10 min), never a stop.  At start they are loaded when the
+file has the same format version and source; samples older than
+`~sample_max_age_s` (7 days) are left out, as are samples with a
+non-finite value or an RTK yaw out of range; samples up to 6 h after the
+current time (a clock set back) count as fresh, later ones are left out
+with a warning.  A broken or foreign file is logged and the collection
+starts empty.  So the bins add up over restarts and drives (before: every
+restart of the node started from 0).  `status.self_cal.samples_file` and
+`samples_note` say what was loaded.
 
 **Parameters** (private): `mag_topic`, `mag_source` (`uncal`), `imu_topic`,
 `rtk_topic`, `relpos_topic`, `motion_topic` (empty: no odometry), `frame_id`
@@ -305,7 +322,9 @@ wheel odometry) and prints the error against RTK — all outputs, `ok`, moving,
 standing — and the share of `ok`.  `--cal-bag BAG2` is the cross test: the
 calibration self-calibrated on BAG2 is frozen and BAG replayed with it.
 `--set KEY=VALUE` changes an estimator parameter, `--dump FILE.npz` writes the
-outputs.  Bags from before report 0x0F only have `/bno085/mag` (picked
+outputs, `--samples FILE` loads the self-calibration samples at the start and
+writes them at the end (with `--cal`/`--save`: drives in a row as on the
+robot).  Bags from before report 0x0F only have `/bno085/mag` (picked
 automatically, source `cal`); a bag without `/gnss_heading/navrelposned`
 is replayed with the variance band alone (printed).
 

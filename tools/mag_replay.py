@@ -2,7 +2,7 @@
 """Replays the mag_heading logic over a bag and compares with the RTK heading.
 
   tools/mag_replay.py BAG [--mag-topic /bno085/mag --source cal] [--two-pass]
-                          [--cal FILE | --cal-bag BAG2] [--save FILE]
+                          [--cal FILE | --cal-bag BAG2] [--save FILE] [--samples FILE]
                           [--fit-interval 45] [--set KEY=VALUE ...] [--dump FILE.npz]
 
 Same code as the node (vitulus_imu.mag_heading), fed in bag order with header
@@ -13,7 +13,10 @@ for pass 2 (shows what a robot with a stored calibration would give).
 --cal-bag BAG2: cross test, the calibration is self-calibrated on BAG2 and
 frozen for BAG (same magnetometer topic and source in both).
 Old bags have only /bno085/mag (calibrated report): --mag-topic /bno085/mag
---source cal (default when the bag has no /bno085/mag_uncal).  A bag without
+--source cal (default when the bag has no /bno085/mag_uncal).
+--samples FILE: the self-calibration samples are loaded from FILE at the start
+(when it exists) and written there at the end, as the node does across
+restarts (with --cal and --save: several bags in a row as on the robot).  A bag without
 /gnss_heading/navrelposned cannot show the carrier fix: the RTK heading is then
 taken by its variance band alone (printed; --no-fixed-gate forces that).
 """
@@ -29,7 +32,7 @@ import numpy as np  # noqa: E402
 import rosbag  # noqa: E402
 
 from vitulus_imu.mag_heading import (DEG, MagHeadingEstimator, load_calibration,  # noqa: E402
-                                     save_calibration, summary)
+                                     load_samples, save_calibration, save_samples, summary)
 
 
 def run(bag_path, topics, est, fit_interval, verbose, rows=None):
@@ -148,6 +151,7 @@ def main():
     ap.add_argument('--cal', help='start from this calibration file')
     ap.add_argument('--cal-bag', help='cross test: self-calibrate on this bag, freeze, replay BAG')
     ap.add_argument('--save', help='write the final calibration here')
+    ap.add_argument('--samples', help='self-calibration samples: loaded from here (if present), written at the end')
     ap.add_argument('--no-selfcal', action='store_true')
     ap.add_argument('--two-pass', action='store_true')
     ap.add_argument('--fit-interval', type=float, default=45.0)
@@ -217,7 +221,16 @@ def main():
     else:
         tp, pr = setup(a.bag)
         est = MagHeadingEstimator(cal, **pr)
+        if a.samples and os.path.exists(a.samples):
+            st, note = load_samples(a.samples, a.source)
+            print(note)
+            if st is not None:
+                t_first = next(rosbag.Bag(a.bag).read_messages(topics=[tp['imu']]))[2].to_sec()
+                print('samples restored: %d' % est.restore_samples(st, t_first))
         states, fits, n_mag, reasons = run(a.bag, tp, est, a.fit_interval, not a.quiet, rows)
+        if a.samples:
+            save_samples(a.samples, est.bins.state(), a.source, est.t_mag or 0.0)
+            print('samples (%d, %d bins) written to %s' % (est.bins.total(), est.bins.coverage(3), a.samples))
         acc = sum(1 for _, r in fits if r['accepted'])
         print('magnetometer samples %d, fits %d, accepted %d, RTK used %d, RTK glitches %d' % (
             n_mag, len(fits), acc, est.rtk_used, est.rtk_glitches))
