@@ -17,6 +17,11 @@
         <param name="rtk_cov_min" value="0.00043"/>
         <param name="rtk_cov_max" value="0.00079"/>
         <param name="rtk_require_fixed" value="true"/>
+        <!-- T35 I2 2026-11-16: sigma ve stavu ok podle chyby merene proti RTK kurzu
+             (18 jizd: median sigmy 4,0 -> 2,2 deg, chyba pod 2 sigma v 99,6 %); jen
+             kovariance vystupu, kurz sam se nemeni.
+             ROLLBACK: sigma_from_rtk:=false (sigma jako drive, zaklad sigma_ok_deg 4 deg). -->
+        <param name="sigma_from_rtk" value="true"/>
         <param name="fuse_tau_s" value="60.0"/>
         <param name="freeze_standing" value="true"/>
         <param name="calibration_file" value="$(env HOME)/.ros/vitulus_imu/mag_calibration.yaml"/>
