@@ -27,6 +27,11 @@
         <param name="calibration_file" value="$(env HOME)/.ros/vitulus_imu/mag_calibration.yaml"/>
         <param name="self_calibrate" value="true"/>
         <param name="fit_interval_s" value="45.0"/>
+        <!-- T35 I3 2026-11-16: vzorek samokalibrace se zaradi, az kdyz RTK kurz zustal
+             platny jeste 10 s po nem (pred ztratou RTK u garaze je kurz mimo; 18 jizd:
+             ze 131 vzorku zahazovanych pri zpresneni jich 115 vubec nevznikne).
+             ROLLBACK: sample_confirm_s:=0 (vzorky se berou hned jako drive). -->
+        <param name="sample_confirm_s" value="10.0"/>
     </node>
 
 
