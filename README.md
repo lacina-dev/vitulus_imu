@@ -300,7 +300,11 @@ current time (a clock set back) count as fresh, later ones are left out
 with a warning.  A broken or foreign file is logged and the collection
 starts empty.  So the bins add up over restarts and drives (before: every
 restart of the node started from 0).  `status.self_cal.samples_file` and
-`samples_note` say what was loaded.
+`samples_note` say what was loaded and, after every write, what is on disk
+now (`samples file …: N samples, B bins, written <time>`, or `cannot be
+written (samples in memory only)` with the time of the last good write);
+`samples_saved_age_s` is the age of the last write of this run (null before
+the first).
 
 **Parameters** (private): `mag_topic`, `mag_source` (`uncal`), `imu_topic`,
 `rtk_topic`, `relpos_topic`, `motion_topic` (empty: no odometry), `frame_id`

@@ -82,6 +82,7 @@ class MagHeadingNode(object):
         self.samples_file = os.path.expanduser(samples_file) if samples_file else ''
         self.samples_save_s = float(rospy.get_param('~samples_save_s', 60.0))
         self.saved_added = 0
+        self.samples_saved_t = None              # time of the last successful write (this run)
         self.save_lock = threading.Lock()        # one writer of the samples file at a time
 
         self.lock = threading.Lock()
@@ -162,8 +163,20 @@ class MagHeadingNode(object):
             now = rospy.get_time() or time.time()
             ok = try_save_samples(self.samples_file, st, self.est.p['source'], now,
                                   warn=lambda text: rospy.logwarn_throttle(600, text))
+            # I1: the note in the status says what is on disk now, not what
+            # was found at the start ('no samples file' stayed there for good)
             if ok:
                 self.saved_added = added
+                self.samples_saved_t = now
+                self.samples_note = 'samples file %s: %d samples, %d bins, written %s' % (
+                    self.samples_file, int(st['count'].sum()),
+                    int((st['count'] >= self.est.p['min_per_bin']).sum()),
+                    time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now)))
+            else:
+                self.samples_note = 'samples file %s: cannot be written (samples in memory only); %s' % (
+                    self.samples_file, 'never written by this run' if self.samples_saved_t is None
+                    else 'last written %s' % time.strftime('%Y-%m-%d %H:%M:%S',
+                                                            time.localtime(self.samples_saved_t)))
             return ok
 
     def on_save_samples(self, event=None):
@@ -226,6 +239,9 @@ class MagHeadingNode(object):
         s['mag_topic'] = self.mag_topic
         s['self_cal']['samples_file'] = self.samples_file or None
         s['self_cal']['samples_note'] = self.samples_note
+        s['self_cal']['samples_saved_age_s'] = (
+            None if self.samples_saved_t is None
+            else round(max(0.0, (rospy.get_time() or time.time()) - self.samples_saved_t), 0))
         self.status_pub.publish(String(json.dumps(s)))
 
     def on_fit(self, _event):
