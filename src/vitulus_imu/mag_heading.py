@@ -988,6 +988,13 @@ class MagHeadingEstimator(object):
         'fit_reject_err_deg': 20.0,
         'fit_max_rejected': 0.3,
         'rtk_settle_s': 5.0,          # RTK valid this long before samples are taken
+        # I3 (T35): ... and this long AFTER the sample, without a break: the
+        # RTK heading is off for the last seconds before it is lost in front of
+        # the garage (valid by fix and variance, 6 deg off in the median), so
+        # a sample waits and is taken only when RTK stayed valid; when RTK is
+        # lost first, the waiting samples are dropped.  0 (default): taken at
+        # once, as before.
+        'sample_confirm_s': 0.0,
         'fit_max_p90_deg': 8.0,
         'fit_max_worse_deg': 1.0,
         'sample_max_age_s': 7 * 86400.0,   # older self-calibration samples are not used
@@ -1034,6 +1041,8 @@ class MagHeadingEstimator(object):
         self.last_b = None
         self.last_out_t = -1e18
         self.last_sample_t = -1e18
+        self.sample_wait = deque()       # I3: samples waiting for sample_confirm_s of valid RTK after them
+        self.samples_unconfirmed = 0     # I3: waiting samples dropped because RTK was lost first
         self.anchors = deque(maxlen=30)
         self.anchor = None
         self.t_rtk = None
@@ -1234,6 +1243,8 @@ class MagHeadingEstimator(object):
         self.t_mag = t
         if self.cal is not None:
             self._fuse(t, b)
+        if self.p['self_calibrate'] and self.sample_wait:
+            self._confirm_samples(t)                 # I3
         if self.p['self_calibrate'] and t - self.last_sample_t >= self.p['sample_period_s']:
             ref = self.rtk_yaw(t)
             if ref is not None:
@@ -1249,7 +1260,28 @@ class MagHeadingEstimator(object):
         k = self.p['window_k']
         if len(w) > k:
             w = w[np.linspace(0, len(w) - 1, k).round().astype(int)]
+        if self.p['sample_confirm_s'] > 0.0:         # I3: taken by _confirm_samples
+            self.sample_wait.append((t, b, self.level, w[:, 1:4].copy(), w[:, 4:13].copy(),
+                                     self.yaw_m - w[:, 13], ref))
+            return
         self.bins.add(t, b, self.level, w[:, 1:4], w[:, 4:13], self.yaw_m - w[:, 13], ref)
+
+    def _confirm_samples(self, t):
+        """I3: the waiting samples whose RTK reference has stayed valid for
+        sample_confirm_s after them go to the bins; when the RTK heading was
+        lost (no valid message for rtk_hold_s) or its valid stretch began anew
+        after a sample, the sample is dropped: it may come from the seconds
+        before the loss, where the heading is already off."""
+        wait = self.sample_wait
+        if self.t_rtk is None or self.t_rtk_since is None or t - self.t_rtk > self.p['rtk_hold_s']:
+            self.samples_unconfirmed += len(wait)
+            wait.clear()
+            return
+        while wait and wait[0][0] < self.t_rtk_since:
+            wait.popleft()
+            self.samples_unconfirmed += 1
+        while wait and self.t_rtk - wait[0][0] >= self.p['sample_confirm_s']:
+            self.bins.add(*wait.popleft())
 
     def restore_samples(self, state, now):
         """Self-calibration samples from load_samples(): those not older than
@@ -1286,6 +1318,8 @@ class MagHeadingEstimator(object):
         self.mag.clear()
         self.pending.clear()
         self.anchors.clear()
+        self.samples_unconfirmed += len(self.sample_wait)    # I3
+        self.sample_wait.clear()
         self.t_rtk = None
         self.resets += 1
         self.reset_reason = reason
@@ -1653,6 +1687,9 @@ class MagHeadingEstimator(object):
                          'refinements': None if cal is None else int(cal.refine['count']),
                          'offset_refined_deg': None if cal is None else r2(cal.refine['offset_sum_deg']),
                          'axis_weighting': bool(self.weighted)}
+        if p['sample_confirm_s'] > 0.0:                      # I3
+            s['self_cal'].update(sample_confirm_s=p['sample_confirm_s'], samples_waiting=len(self.sample_wait),
+                                 samples_unconfirmed=self.samples_unconfirmed)
         cmp = {'rtk_valid': ref_ok, 'rtk_reason': ref_reason, 'rtk_require_fixed': bool(p['rtk_require_fixed']),
                'rtk_used': self.rtk_used, 'rtk_glitches': self.rtk_glitches,
                'window_s': p['stats_window_s']}

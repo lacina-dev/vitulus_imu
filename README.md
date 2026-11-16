@@ -266,6 +266,18 @@ band 5° (max 19°); inside the band max 5.9°.  When NAV-RELPOSNED does not
 arrive the RTK heading is not taken and `rtk_compare.rtk_reason` says so
 (`~rtk_require_fixed:=false` falls back to the variance band alone).
 
+**Samples only from RTK that stayed valid** (`~sample_confirm_s`, default 0 =
+off; T35 I3).  In front of the garage the RTK heading is off for the last
+seconds before it is lost (full fix, variance in the band, 6° off in the
+median).  With `~sample_confirm_s` N > 0 a self-calibration sample waits and
+goes to the bins only when the RTK heading stayed a valid reference for N s
+after it without a break; when RTK is lost first (or the gyro origin moves)
+the waiting samples are dropped.  On the samples of 18 drives 2026-11-15/16
+(981, of which the refinement dropped 131 for the field strength) 10 s keeps
+115 of those 131 out, at the cost of 130 of the 850 good ones.
+`status.self_cal` then has `sample_confirm_s`, `samples_waiting` and
+`samples_unconfirmed` (dropped so far).
+
 **RTK against the gyro:** the RTK yaw minus the game yaw is a slowly moving
 offset.  A valid RTK message whose offset is more than `~rtk_gyro_tol_deg`
 (15°) from the mean of the last 30 is ignored (counted in
