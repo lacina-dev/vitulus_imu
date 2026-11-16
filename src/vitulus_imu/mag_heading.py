@@ -948,6 +948,22 @@ class MagHeadingEstimator(object):
         # (0.2 deg/min: 7 deg after an hour) while the state stays ok.
         # sigma_k 0.5 would make error = 2 sigma.
         'sigma_k': 0.6,
+        # I2 (T35, 18 drives 2026-11-15/16): sigma was sigma_ok_deg (4.0) or a
+        # little above while the error against RTK was 1.2 deg RMS.  On: the
+        # base of sigma (state ok, anchor confirmed, window settled) follows
+        # the error measured against the RTK heading while that is a valid
+        # reference:
+        #   base = clip(sigma_rtk_k x RMS(error), sigma_min_deg, sigma_ok_deg)
+        # RMS over about sigma_rtk_tau_s of comparison time (running mean, then
+        # exponential forgetting), used after sigma_rtk_min_s of it; it is kept
+        # when RTK is gone, and the terms above (deviation from the anchor,
+        # innovation, hold) still raise sigma over the base.  Never above what
+        # sigma was without it.  Off (default): as before.
+        'sigma_from_rtk': False,
+        'sigma_min_deg': 1.5,
+        'sigma_rtk_k': 1.5,
+        'sigma_rtk_tau_s': 300.0,
+        'sigma_rtk_min_s': 30.0,
         'gyro_drift_deg_min': 0.2,    # drift of the game rotation vector (measured 0.12..0.19)
         'anchor_from_rtk': True,
         'max_anchor_dev_deg': 10.0,
@@ -1030,6 +1046,9 @@ class MagHeadingEstimator(object):
         self.out = None
         self.last_err = None
         self.errors = deque()            # (t, |err| deg, ok, moving: True / False / None)
+        self.sig_m2 = None               # I2: mean squared error against RTK (deg^2), state ok
+        self.sig_T = 0.0                 # I2: comparison time behind it (s)
+        self.sig_t = None                # I2: time of the last comparison
         self.last_fit = None
         self.resets = 0
         self.reset_reason = None
@@ -1374,9 +1393,34 @@ class MagHeadingEstimator(object):
         hold = 0.0 if self.f_used_t is None else max(0.0, t - self.f_used_t)
         confirmed = self.anc is not None and self.anc[2] == 'rtk'
         base = p['sigma_ok_deg'] if confirmed and self.f_W >= p['sigma_settle_s'] else p['sigma_start_deg']
+        if p['sigma_from_rtk'] and base == p['sigma_ok_deg']:
+            meas = self.sigma_measured()
+            if meas is not None:                     # I2: never above sigma_ok_deg
+                base = min(base, max(p['sigma_min_deg'], p['sigma_rtk_k'] * meas))
         refined = abs(self.cal.refine['offset_sum_deg']) if self.cal is not None else 0.0
         return max(base, p['sigma_k'] * (dev + (drift or 0.0))
                    + p['gyro_drift_deg_min'] * hold / 60.0) + refined, hold
+
+    def sigma_measured(self):
+        """I2: RMS error against the RTK heading (deg) over the last
+        ~sigma_rtk_tau_s of comparisons in state ok; None before
+        sigma_rtk_min_s of them."""
+        if self.sig_m2 is None or self.sig_T < self.p['sigma_rtk_min_s']:
+            return None
+        return math.sqrt(self.sig_m2)
+
+    def _sigma_measure(self, t, err):
+        """I2: one comparison with the RTK heading in state ok."""
+        p = self.p
+        dt = p['out_period_s']
+        if self.sig_t is not None and 0.0 < t - self.sig_t <= 1.0:
+            dt = t - self.sig_t
+        self.sig_t = t
+        self.sig_T = min(self.sig_T + dt, 10.0 * p['sigma_rtk_tau_s'])
+        if self.sig_m2 is None:
+            self.sig_m2 = err * err
+        else:
+            self.sig_m2 += min(1.0, dt / max(min(self.sig_T, p['sigma_rtk_tau_s']), dt)) * (err * err - self.sig_m2)
 
     # -- output ---------------------------------------------------------------
 
@@ -1447,6 +1491,8 @@ class MagHeadingEstimator(object):
             out['rtk_err_deg'] = err
             self.last_err = (t, err, ok)
             self.errors.append((t, abs(err), ok, self.f_moving))
+            if p['sigma_from_rtk'] and ok and math.isfinite(err):
+                self._sigma_measure(t, err)              # I2
         while self.errors and self.errors[0][0] < t - p['stats_window_s']:
             self.errors.popleft()
         self.out = out
@@ -1562,6 +1608,9 @@ class MagHeadingEstimator(object):
             s.update(yaw_deg=r2(out['yaw'] * DEG), sigma_deg=r2(out['sigma_deg']),
                      dF_pct=r2(out['dF_pct']), dIncl_deg=r2(out['dIncl_deg']),
                      gyro_std_deg=r2(out['gyro_std_deg']), gyro_drift_deg=r2(out['gyro_drift_deg']))
+        if p['sigma_from_rtk']:                              # I2
+            s['sigma'] = {'from_rtk': True, 'ok_deg': p['sigma_ok_deg'], 'min_deg': p['sigma_min_deg'],
+                          'measured_rms_deg': r2(self.sigma_measured()), 'measured_s': r2(self.sig_T, 0)}
         moving = self.moving(now)
         fz = bool(p['freeze_standing'])
         s['fusion'] = {

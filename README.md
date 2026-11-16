@@ -163,6 +163,19 @@ heading is valid: `err_deg` (current error), and over the last
      deviation, because a drift of the gyro and a field that crept off
      cannot be told apart any more.  While the robot stands (correction
      frozen) σ grows by the full 0.2°/min of the hold.
+
+     With `~sigma_from_rtk` (default **off**; T35 I2) the base in state
+     `ok` with a confirmed anchor follows the error measured against the
+     RTK heading while that is a valid reference: base =
+     clip(`~sigma_rtk_k` (1.5) × RMS error, `~sigma_min_deg` (1.5°),
+     `~sigma_ok_deg`), RMS over about `~sigma_rtk_tau_s` (300 s) of
+     comparisons, used after `~sigma_rtk_min_s` (30 s) of them and kept
+     when RTK is gone.  σ is never above what it is without it; the other
+     terms raise it as before.  18 drives 2026-11-15/16 (recomputed from
+     the recorded outputs): σ median 4.0° → 2.2°, error below 2σ in 99.6 %
+     of the `ok` outputs (RMS error 1.18°).  Status then has `sigma`:
+     `from_rtk`, `ok_deg`, `min_deg`, `measured_rms_deg` (null before 30 s
+     of comparisons), `measured_s`.
 5. Gate as above, F = hypot(|Hc|·H0, Bz), I = atan2(−Bz, |Hc|·H0), H0 = mean semi-axis.
 6. Self-calibration: while RTK is valid (and has been for `~rtk_settle_s`,
    5 s; RTK samples that disagree with the gyro by > 15° are ignored, see
