@@ -4,6 +4,9 @@
 
 Parsing on bytes, then the node against the fake sensor on a pty and a private
 roscore (port 11873): with 0x0F streaming, and with a sensor that refuses it.
+The node tests run for the Python node and, with BNO085_CPP_NODE=/path/to/
+bno085_node_cpp (built outside the live workspace), for the C++ node as well;
+without the variable the C++ runs are skipped.
 """
 import importlib.machinery
 import importlib.util
@@ -24,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 NODE = os.path.join(ROOT, 'nodes', 'bno085_node')
 PORT = 11873
+CPP = os.environ.get('BNO085_CPP_NODE', '')
 sys.path.insert(0, HERE)
 
 
@@ -164,13 +168,22 @@ class Watch(object):
         return test()
 
 
-def run_node(ros, sensor, seconds_check):
+@pytest.fixture(params=['python', 'cpp'])
+def node_cmd(request):
+    if request.param == 'cpp':
+        if not (CPP and os.access(CPP, os.X_OK)):
+            pytest.skip('BNO085_CPP_NODE is not set to an executable bno085_node_cpp')
+        return [CPP]
+    return [sys.executable, NODE]
+
+
+def run_node(ros, sensor, seconds_check, node_cmd):
     from fake_bno085 import FakeSensor  # noqa: F401 - imported for the type only
     import rospy
     rospy.set_param('/bno085_node/failures', 0)
     logpath = os.path.join(ros.tmp, 'node_%d.log' % time.monotonic_ns())
     log = open(logpath, 'wb')
-    p = subprocess.Popen([sys.executable, NODE, '__name:=bno085_node', '_port:=' + sensor.path],
+    p = subprocess.Popen(node_cmd + ['__name:=bno085_node', '_port:=' + sensor.path],
                          stdout=log, stderr=subprocess.STDOUT, env=ros.env, start_new_session=True)
     watch = Watch()
     try:
@@ -183,10 +196,13 @@ def run_node(ros, sensor, seconds_check):
         p.wait()
         log.close()
     with open(logpath, 'rb') as fh:
-        return fh.read().decode(errors='replace') + '\n'.join(watch.logs)
+        console = fh.read().decode(errors='replace')
+    if node_cmd == [CPP]:
+        console = ''        # roscpp prints every /rosout line on the console too: count each once
+    return console + '\n'.join(watch.logs)
 
 
-def test_node_publishes_mag_uncal(ros):
+def test_node_publishes_mag_uncal(ros, node_cmd):
     from fake_bno085 import FakeSensor
     sensor = FakeSensor()
 
@@ -210,13 +226,13 @@ def test_node_publishes_mag_uncal(ros):
         assert p.poll() is None
 
     try:
-        out = run_node(ros, sensor, check)
+        out = run_node(ros, sensor, check, node_cmd)
     finally:
         sensor.close()
     assert '0x0F' not in out, out
 
 
-def test_node_runs_on_without_mag_uncal(ros):
+def test_node_runs_on_without_mag_uncal(ros, node_cmd):
     from fake_bno085 import FakeSensor
     sensor = FakeSensor()
     sensor.refuse = {0x0F}
@@ -232,7 +248,7 @@ def test_node_runs_on_without_mag_uncal(ros):
         assert not w.uncal
 
     try:
-        out = run_node(ros, sensor, check)
+        out = run_node(ros, sensor, check, node_cmd)
     finally:
         sensor.close()
     # One connection: soft_reset sends the reset command twice, a reconnect would add more.
@@ -240,7 +256,7 @@ def test_node_runs_on_without_mag_uncal(ros):
     assert out.count('0x0F not enabled') == 1, out
 
 
-def test_health_no_data_when_0f_stops(ros):
+def test_health_no_data_when_0f_stops(ros, node_cmd):
     from fake_bno085 import FakeSensor
     sensor = FakeSensor()
 
@@ -256,6 +272,6 @@ def test_health_no_data_when_0f_stops(ros):
         assert w.until(lambda: w.health.get('mag_uncal') == 'on', 5.0), w.health
 
     try:
-        run_node(ros, sensor, check)
+        run_node(ros, sensor, check, node_cmd)
     finally:
         sensor.close()

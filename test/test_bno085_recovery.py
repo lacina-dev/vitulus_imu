@@ -5,6 +5,9 @@
 
 Every scenario runs the new node and, where it names a limit for it, the node of
 git HEAD (`--old-ref`), which has to show the old fault within that limit.
+With BNO085_CPP_NODE=/path/to/bno085_node_cpp every scenario also runs the C++
+node (label `cpp`), against the same checks as the new Python node; without it
+the C++ runs are skipped.  `--variants new,cpp` picks the labels.
 Touches no serial port and no running ROS: all goes to its own master.
 """
 import argparse
@@ -30,6 +33,7 @@ from fake_bno085 import FakeSensor  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument('--port', type=int, default=11871)
 ap.add_argument('--old-ref', default='HEAD')
+ap.add_argument('--variants', default='new,old,cpp')
 ap.add_argument('names', nargs='*')
 ARGS = ap.parse_args()
 TMP = tempfile.mkdtemp(prefix='bno085_test_')
@@ -43,6 +47,7 @@ from std_msgs.msg import String  # noqa: E402
 from vitulus_msgs.msg import Imu_status  # noqa: E402
 
 NEW = os.path.join(ROOT, 'nodes', 'bno085_node')
+CPP = os.environ.get('BNO085_CPP_NODE', '')      # the C++ node, built outside the live workspace
 OLD_LIMIT = 10.0             # how long the old node is given to get out of a fault
 
 
@@ -50,7 +55,7 @@ class Node(object):
     def __init__(self, script, port, params=()):
         self.log = open(os.path.join(TMP, 'node.log'), 'ab')
         args = ['__name:=bno085_node', '_port:=' + port] + list(params)
-        self.p = subprocess.Popen([sys.executable, script] + args, stdout=self.log,
+        self.p = subprocess.Popen(([script] if script == CPP else [sys.executable, script]) + args, stdout=self.log,
                                   stderr=subprocess.STDOUT, start_new_session=True)
 
     def wait(self, limit):
@@ -329,7 +334,10 @@ time.sleep(30)
 def run_supervisor(script, sensor, watch, old):
     for mode, want, limit in (('stuck', 4, 3.0), ('shutdown', 0, 2.0)):
         t0 = time.monotonic()
-        p = subprocess.run([sys.executable, '-c', SUPERVISOR, script, mode], timeout=10, stdout=subprocess.DEVNULL)
+        cmd = [sys.executable, '-c', SUPERVISOR, script, mode]
+        if script == CPP:            # the same watchdog class, built next to the node
+            cmd = [os.path.join(os.path.dirname(CPP), 'bno085_supervisor_test'), mode]
+        p = subprocess.run(cmd, timeout=10, stdout=subprocess.DEVNULL)
         took = time.monotonic() - t0
         check(p.returncode == want and took < limit + 1.5, '%s: exit %d in %.1f s' % (mode, p.returncode, took))
 
@@ -374,10 +382,15 @@ def main():
         rospy.init_node('bno085_test', disable_signals=True)
         watch = Watch()
         old = old_script(os.path.join(TMP, 'bno085_node_old'))
+        variants = [v for v in (('new', NEW, False), ('old', old, True), ('cpp', CPP, False))
+                    if v[0] in ARGS.variants.split(',')]
+        if 'cpp' in ARGS.variants.split(',') and not (CPP and os.access(CPP, os.X_OK)):
+            print('SKIP cpp: BNO085_CPP_NODE %s' % ('not set' if not CPP else 'is not an executable: ' + CPP))
+            variants = [v for v in variants if v[0] != 'cpp']
         for name, fn, with_old in SCENARIOS:
             if ARGS.names and name not in ARGS.names:
                 continue
-            for label, script, is_old in (('new', NEW, False), ('old', old, True)):
+            for label, script, is_old in variants:
                 if is_old and not with_old:
                     continue
                 rospy.set_param('/bno085_node/failures', 0)

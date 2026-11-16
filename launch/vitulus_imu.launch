@@ -2,7 +2,18 @@
 
 
 <!--    #### BNO085Node publish imu and mag messages #####-->
-    <node name="bno085_node" pkg="vitulus_imu" type="bno085_node" respawn="true"
+    <!-- T39 2026-11-16: ovladac BNO085 ma dve provedeni se stejnym jmenem uzlu, tematy,
+         parametry a kody ukonceni: python = nodes/bno085_node (vychozi, jako dosud),
+         cpp = src/bno085_node.cpp (binarka bno085_node_cpp; mene CPU, rovnomernejsi perioda).
+         Jina hodnota nez cpp = python.  cpp NENASAZENO, ceka na zkousku na skutecnem cidle.
+         Prepinani na robotu: VITULUS_IMU_DRIVER=cpp v ~/.bashrc + restart stacku.
+         ROLLBACK: promennou odebrat (vychozi python). -->
+    <arg name="imu_driver" default="$(optenv VITULUS_IMU_DRIVER python)"/>
+    <node unless="$(eval str(arg('imu_driver')) == 'cpp')"
+          name="bno085_node" pkg="vitulus_imu" type="bno085_node" respawn="true"
+          respawn_delay="1" output="log"/>
+    <node if="$(eval str(arg('imu_driver')) == 'cpp')"
+          name="bno085_node" pkg="vitulus_imu" type="bno085_node_cpp" respawn="true"
           respawn_delay="1" output="log"/>
 
 <!--    #### Heading from the magnetometer (published and compared with RTK; navigation does not use it) #####-->

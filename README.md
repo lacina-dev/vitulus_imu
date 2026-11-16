@@ -16,6 +16,48 @@ respawn, `/bno085/health`); see the docstring of `nodes/bno085_node`.
 | `/bno085/imu_status` | vitulus_msgs/Imu_status | 1 Hz |
 | `/bno085/health` | std_msgs/String JSON | latched, 1 Hz; also `mag_accuracy` (0–3, BNO accuracy of report 0x03), `mag_uncal` (`on` / `no data` / `unavailable` / `off`; `no data` also when 0x0F stops for `~mag_uncal_stale_s`, 2 s, while the rest streams), `mag_uncal_accuracy`, `mag_bias_uT` (the BNO's own hard-iron estimate from 0x0F) |
 
+Sensor reports are asked for at the library default, 50 ms: the values on the
+100 Hz topics change 20 times a second and the stamp is the time of publishing,
+not of the measurement (so in both drivers below).
+
+#### Two drivers, one switch (`imu_driver`, T39 2026-11-16)
+The driver exists twice, with the same node name, topics, types, parameters,
+health JSON, exit codes and bytes on the line:
+
+| `imu_driver` | executable | |
+|---|---|---|
+| `python` (default; any value but `cpp`) | `nodes/bno085_node` | as before, uses `adafruit_bno08x` |
+| `cpp` | `bno085_node_cpp` (`src/bno085_node.cpp`, `src/bno085_supervisor.h`) | the same logic in C++ (roscpp, termios; no new dependency): the port is read in blocks, not byte by byte |
+
+**State: `cpp` is NOT deployed and not tried on the real sensor yet** — only
+against the fake sensor of the tests.  The robot runs `python`.
+
+Switch on the robot: `export VITULUS_IMU_DRIVER=cpp` in `~/.bashrc` (sourced by `vitulus.service`) and restart the
+stack; remove the line to go back to Python. By hand: `roslaunch vitulus_imu vitulus_imu.launch imu_driver:=cpp`, or
+`<arg name="imu_driver" value="cpp"/>` in the include of `vitulus_imu.launch`
+(`vitulus/launch/vitulus_start.launch`, `vitulus_bringup/launch/vitulus_indoor.launch`);
+the package has to be built first (`bno085_node_cpp` in `devel/lib/vitulus_imu`).
+Back: `imu_driver:=python` or leave the argument out.  Only one of the two may
+run: both lock the port (`flock`), the second one fails to connect and exits 1.
+
+Known differences of `cpp`: `header.seq` of a topic starts at 0 (rospy: 1;
+roscpp numbers it itself); after a failure the process leaves 0.2 s later (so
+that the last health message gets out); log lines of the first moments reach
+the log file but not always `/rosout`; the library's busy waits during the
+start sleep 0.5 ms; an unknown report during the start ends the process with
+exit 1 and a FATAL line (Python: traceback, exit 1).
+
+Measured on the fake sensor only (`tools/bno085_bench.py`: pty, 60 s per run,
+nodes at nice 0, robot computer in the dock with load average 6.7) — an
+indication, not the real sensor:
+
+| sensor reports | driver | CPU of the node (one core) | period of `/bno085/imu`, ms: min / median / p99 / max | periods off 10 ms by more than 1 ms |
+|---|---|---|---|---|
+| 20 Hz (what the node asks for) | `python` | 6.82 % | 0.19 / 10.00 / 12.75 / 21.99 | 40.6 % |
+| | `cpp` | 0.90 % | 1.33 / 10.00 / 11.48 / 18.66 | 2.9 % |
+| 100 Hz (heavier stream) | `python` | 21.47 % | 0.21 / 10.03 / 14.99 / 113.36 | 66.6 % |
+| | `cpp` | 0.97 % | 0.02 / 10.00 / 10.38 / 22.38 | 1.1 % |
+
 Report 0x0F (SH-2 "Magnetic Field Uncalibrated", 16 bytes: id, seq, status
 with accuracy in bits 1:0, delay, X Y Z uncalibrated, X Y Z bias, int16 LE,
 Q4 µT) is optional: if the sensor does not enable it the node runs on without
@@ -361,8 +403,19 @@ is replayed with the variance band alone (printed).
 ```
 nice -n 10 python3 -m pytest test/test_mag_heading.py -q
 nice -n 10 python3 -m pytest test/test_bno085_mag_uncal.py -q
-nice -n 10 python3 test/test_bno085_recovery.py [--old-ref REF]
+nice -n 10 python3 test/test_bno085_recovery.py [--old-ref REF] [--variants new,old,cpp]
+nice -n 10 python3 -m pytest test/test_bno085_equivalence.py -q
 ```
+The bno085 tests run the Python node and, with
+`BNO085_CPP_NODE=<workspace>/devel/lib/vitulus_imu/bno085_node_cpp` in the
+environment, the C++ node against the same checks (without it the C++ runs are
+skipped, `test_bno085_equivalence.py` as a whole).  `test_bno085_equivalence.py`
+feeds both nodes the same bytes and compares messages, bytes sent to the sensor
+and health.  The old faults of `test_bno085_recovery.py` need
+`--old-ref 835d38f~1` (the node before the recovery fix).  Build for the tests
+outside the live workspace, e.g. a workspace in `/tmp` with a link to this
+package, extending `~/catkin_ws/devel`.  `tools/bno085_bench.py` measures CPU
+and period of both drivers on the fake sensor.
 
 ## Replay 2026-11-15: refinement without full coverage
 

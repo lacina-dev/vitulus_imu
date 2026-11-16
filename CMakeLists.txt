@@ -11,6 +11,8 @@ project(vitulus_imu)
 find_package(catkin REQUIRED COMPONENTS
   rospy
   sensor_msgs
+  std_msgs
+  vitulus_msgs
   roscpp
 )
 find_package(cmake_modules REQUIRED)
@@ -72,6 +74,25 @@ add_dependencies(nwu_to_enu sensor_msgs_generate_messages_cpp)
    #${Eigen_LIBRARIES}
  )
 
+# BNO085 UART driver in C++ (same behaviour as nodes/bno085_node; chosen by
+# imu_driver:=cpp in launch/vitulus_imu.launch)
+find_package(Threads REQUIRED)
+add_executable(bno085_node_cpp src/bno085_node.cpp)
+set_target_properties(bno085_node_cpp PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
+target_compile_options(bno085_node_cpp PRIVATE -O2 -Wall -Wextra)
+add_dependencies(bno085_node_cpp ${catkin_EXPORTED_TARGETS})
+target_link_libraries(bno085_node_cpp ${catkin_LIBRARIES} Threads::Threads)
+
+install(TARGETS bno085_node_cpp
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 ################################################################################
 # Test
 ################################################################################
+# The watchdog of bno085_node_cpp alone, for test/test_bno085_recovery.py
+if(CATKIN_ENABLE_TESTING)
+  add_executable(bno085_supervisor_test test/bno085_supervisor_test.cpp)
+  set_target_properties(bno085_supervisor_test PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(bno085_supervisor_test Threads::Threads)
+endif()
