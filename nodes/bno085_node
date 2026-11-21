@@ -20,6 +20,18 @@ Consecutive failures live in ~failures (parameter server, survives the respawn):
 pause before a new try 0, 1, 2, 4 ... ~backoff_max_s seconds.  From
 ~max_failures the state reads `failed`, tries go on at the slowest pace.
 
+~stamp_at_read (default false = header.stamp is the time of publishing, as
+always): true stamps a message with the time its report was read from the
+port: the game rotation vector for bno085/imu, the rotation vector for
+bno085/navheading, report 0x03 for bno085/mag, 0x0F for bno085/mag_uncal.  The
+100 Hz messages that repeat a sample then repeat its stamp too.  The port is
+read once per 100 Hz cycle, so the stamp is up to 10 ms after the arrival.
+TURN IT ON ONLY TOGETHER WITH A FAST REPORT INTERVAL (~fast_report_interval_us
+under 50000): with the 20 Hz reports the stamps of bno085/imu stand still for
+40-65 ms, and navi_transform (heading_imu_interp) drops an RTK heading sample
+whose neighbouring IMU stamps are more than 50 ms away.  The node warns once
+at the start when it is on without a fast interval.
+
   out bno085/imu_status  vitulus_msgs/Imu_status, 1 Hz, also during startup;
                          status true only while fresh packets arrive
       bno085/health      std_msgs/String JSON, latched, 1 Hz:
@@ -162,6 +174,16 @@ class GuardedUart(object):
 class BoundedBNO(BNO08X_UART):
     """BNO08X_UART with a time limit on everything in initialize()."""
 
+    stamp_at_read = False                # ~stamp_at_read, set by the node
+    packet_stamp = None                  # ROS time the packet being handled was read at
+    report_stamp = None                  # report id -> packet_stamp of its last report
+
+    def stamp(self, report_id):
+        """header.stamp for a message made of this report."""
+        if self.stamp_at_read and self.report_stamp and self.report_stamp.get(report_id) is not None:
+            return self.report_stamp[report_id]
+        return rospy.Time.now()
+
     def __init__(self, uart, advert_timeout, should_stop):
         self.advert_timeout = advert_timeout
         self.should_stop = should_stop
@@ -213,6 +235,8 @@ class BoundedBNO(BNO08X_UART):
         packet = super()._read_packet()
         if packet.channel_number == CHANNEL_SENSOR_REPORTS:
             self.last_report_t = time.monotonic()
+            if self.stamp_at_read:
+                self.packet_stamp = rospy.Time.now()
         return packet
 
     def _handle_packet(self, packet):
@@ -221,7 +245,15 @@ class BoundedBNO(BNO08X_UART):
         try:
             _separate_batch(packet, self._packet_slices)
             while self._packet_slices:
-                self._process_report(*self._packet_slices.pop())
+                report_id, report_bytes = self._packet_slices.pop()
+                self._process_report(report_id, report_bytes)
+                if self.stamp_at_read:
+                    if self.report_stamp is None:
+                        self.report_stamp = {}
+                    if report_id == 0xFC:        # feature response: the reading is zeros again
+                        self.report_stamp.pop(report_bytes[1], None)
+                    else:
+                        self.report_stamp[report_id] = self.packet_stamp
         finally:
             del self._packet_slices[:]
 
@@ -328,6 +360,12 @@ class BNO085Node:
 
     def __init__(self):
         self.port = rospy.get_param('~port', '/dev/imu')
+        BoundedBNO.stamp_at_read = self.read_switch('~stamp_at_read')
+        if BoundedBNO.stamp_at_read and not self.fast_interval_asked():
+            rospy.logwarn("<{}> stamp_at_read without a fast report interval: messages that repeat a "
+                          "sample repeat its stamp (40-65 ms apart), navi_transform then drops part of "
+                          "the RTK heading samples; turn it on together with "
+                          "fast_report_interval_us".format(rospy.get_caller_id()))
         self.baud = rospy.get_param('~baud', 3000000)
         self.read_timeout_s = rospy.get_param('~read_timeout_s', 0.2)
         self.advert_timeout_s = rospy.get_param('~advert_timeout_s', 3.0)
@@ -398,6 +436,23 @@ class BNO085Node:
         if self.failures <= 1:
             return 0.0
         return min(2.0 ** (self.failures - 2), self.backoff_max_s)
+
+    @staticmethod
+    def read_switch(name):
+        """A parameter that is off unless it clearly says on: true, a number but
+        0, or the text true / 1 / yes / on."""
+        raw = rospy.get_param(name, False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ('true', '1', 'yes', 'on')
+        return isinstance(raw, (bool, int, float)) and bool(raw)
+
+    @staticmethod
+    def fast_interval_asked():
+        """~fast_report_interval_us asks for reports faster than the default."""
+        try:
+            return 5000 <= int(float(rospy.get_param('~fast_report_interval_us', 50000))) < 50000
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def set_state(self, state, reason=''):
         self.state, self.reason = state, reason
@@ -639,7 +694,7 @@ class BNO085Node:
         # orientation_x, orientation_y, orientation_z, orientation_w = self.bno.geomagnetic_quaternion
         orientation_x, orientation_y, orientation_z, orientation_w = self.bno.game_quaternion
         imu_msg = Imu()
-        imu_msg.header.stamp = rospy.Time.now()
+        imu_msg.header.stamp = self.bno.stamp(adafruit_bno08x.BNO_REPORT_GAME_ROTATION_VECTOR)
         imu_msg.header.frame_id = "bno_imu_link"
         imu_msg.orientation.x = orientation_x
         imu_msg.orientation.y = orientation_y
@@ -671,7 +726,7 @@ class BNO085Node:
     def publish_mag(self):
         mag_x, mag_y, mag_z = self.bno.magnetic
         mag_msg = MagneticField()
-        mag_msg.header.stamp = rospy.Time.now()
+        mag_msg.header.stamp = self.bno.stamp(adafruit_bno08x.BNO_REPORT_MAGNETOMETER)
         mag_msg.header.frame_id = "bno_imu_link"
         mag_msg.magnetic_field.x = mag_x * 0.000001
         mag_msg.magnetic_field.y = mag_y * 0.000001
@@ -697,7 +752,7 @@ class BNO085Node:
         self.mag_uncal_state = 'on'
         x, y, z = bno.mag_uncal
         msg = MagneticField()
-        msg.header.stamp = rospy.Time.now()
+        msg.header.stamp = bno.stamp(BNO_REPORT_MAG_UNCAL)
         msg.header.frame_id = "bno_imu_link"
         msg.magnetic_field.x = x * 0.000001
         msg.magnetic_field.y = y * 0.000001
@@ -710,7 +765,7 @@ class BNO085Node:
         gyro_x, gyro_y, gyro_z = self.bno.gyro
         orientation_x, orientation_y, orientation_z, orientation_w = self.bno.quaternion
         imu_msg = Imu()
-        imu_msg.header.stamp = rospy.Time.now()
+        imu_msg.header.stamp = self.bno.stamp(adafruit_bno08x.BNO_REPORT_ROTATION_VECTOR)
         imu_msg.header.frame_id = "bno_imu_link"
         imu_msg.orientation.x = orientation_x
         imu_msg.orientation.y = orientation_y

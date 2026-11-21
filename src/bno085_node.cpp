@@ -372,6 +372,14 @@ class BoundedBNO {
     slices_.reserve(64);
   }
 
+  static bool stamp_at_read;  // ~stamp_at_read, set by the node
+
+  // BoundedBNO.stamp: header.stamp for a message made of this report.
+  ros::Time stamp(uint8_t report_id) const {
+    if (stamp_at_read && has_stamp_[report_id]) return report_stamp_[report_id];
+    return ros::Time::now();
+  }
+
   std::shared_ptr<Telemetry> tele;
   double mag_uncal[3] = {0.0, 0.0, 0.0};  // uT
   long mag_uncal_count = 0;
@@ -522,6 +530,10 @@ class BoundedBNO {
     }
     sequence_number_[packet.channel] = packet.sequence;  // _update_sequence_number
     if (packet.channel == CHANNEL_SENSOR_REPORTS) {
+      if (stamp_at_read) {
+        packet_stamp_ = ros::Time::now();
+        packet_set_ = true;
+      }
       std::lock_guard<std::mutex> lock(tele->m);
       tele->last_report_t = monotonic();
       tele->has_report_t = true;
@@ -670,6 +682,14 @@ class BoundedBNO {
       const uint8_t* report = slices_.back();
       slices_.pop_back();
       processReport(report[0], report);
+      if (stamp_at_read) {
+        if (report[0] == GET_FEATURE_RESPONSE) {  // the reading is zeros again
+          has_stamp_[report[1]] = false;
+        } else {
+          report_stamp_[report[0]] = packet_stamp_;
+          has_stamp_[report[0]] = packet_set_;
+        }
+      }
     }
   }
 
@@ -739,6 +759,10 @@ class BoundedBNO {
     }
   }
 
+  ros::Time packet_stamp_;       // ROS time the packet being handled was read at
+  bool packet_set_ = false;
+  ros::Time report_stamp_[256];  // packet_stamp_ of the last report of an id
+  bool has_stamp_[256] = {false};
   GuardedUart& uart_;
   double advert_timeout_;
   std::function<bool()> should_stop_;
@@ -751,6 +775,8 @@ class BoundedBNO {
   bool uncal_in_packet_ = false;
   bool id_read_ = false;
 };
+
+bool BoundedBNO::stamp_at_read = false;
 
 // ---------------------------------------------------------------------------
 // json.dumps and float repr of Python, for bno085/health.
@@ -862,6 +888,46 @@ static bool paramTruthy(const std::string& name, bool fallback) {
   return true;
 }
 
+// BNO085Node.read_switch: off unless it clearly says on (true, a number but 0,
+// or the text true / 1 / yes / on).
+static bool paramSwitch(const std::string& name) {
+  XmlRpc::XmlRpcValue v;
+  if (!ros::param::get(name, v)) return false;
+  if (v.getType() == XmlRpc::XmlRpcValue::TypeBoolean) return static_cast<bool>(v);
+  if (v.getType() == XmlRpc::XmlRpcValue::TypeInt) return static_cast<int>(v) != 0;
+  if (v.getType() == XmlRpc::XmlRpcValue::TypeDouble) return static_cast<double>(v) != 0.0;
+  if (v.getType() != XmlRpc::XmlRpcValue::TypeString) return false;
+  std::string text = static_cast<std::string>(v);
+  const size_t first = text.find_first_not_of(" \t\r\n");
+  const size_t last = text.find_last_not_of(" \t\r\n");
+  text = first == std::string::npos ? std::string() : text.substr(first, last - first + 1);
+  for (char& c : text) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+  return text == "true" || text == "1" || text == "yes" || text == "on";
+}
+
+// BNO085Node.fast_interval_asked: ~fast_report_interval_us asks for reports
+// faster than the default.
+static bool fastIntervalAsked() {
+  XmlRpc::XmlRpcValue v;
+  if (!ros::param::get("~fast_report_interval_us", v)) return false;
+  double d = 0.0;
+  if (v.getType() == XmlRpc::XmlRpcValue::TypeInt) {
+    d = static_cast<int>(v);
+  } else if (v.getType() == XmlRpc::XmlRpcValue::TypeDouble) {
+    d = static_cast<double>(v);
+  } else if (v.getType() == XmlRpc::XmlRpcValue::TypeBoolean) {
+    d = static_cast<bool>(v) ? 1.0 : 0.0;
+  } else if (v.getType() == XmlRpc::XmlRpcValue::TypeString) {
+    const std::string text = static_cast<std::string>(v);
+    char* end = nullptr;
+    d = strtod(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0') return false;
+  } else {
+    return false;
+  }
+  return std::isfinite(d) && d >= 5000.0 && std::trunc(d) < 50000.0;
+}
+
 // ---------------------------------------------------------------------------
 
 static std::atomic<bool> g_signal(false);
@@ -879,6 +945,12 @@ class BNO085Node {
       : supervisor_(isShutdown, [this] { publishStatus(); },
                     [](const std::string& text) { ROS_ERROR_STREAM(text); }) {
     ros::param::param<std::string>("~port", port_, "/dev/imu");
+    BoundedBNO::stamp_at_read = paramSwitch("~stamp_at_read");
+    if (BoundedBNO::stamp_at_read && !fastIntervalAsked())
+      ROS_WARN_STREAM("<" << ros::this_node::getName()
+                          << "> stamp_at_read without a fast report interval: messages that repeat a "
+                             "sample repeat its stamp (40-65 ms apart), navi_transform then drops part of "
+                             "the RTK heading samples; turn it on together with fast_report_interval_us");
     baud_ = paramInt("~baud", 3000000);
     read_timeout_s_ = paramDouble("~read_timeout_s", 0.2);
     advert_timeout_s_ = paramDouble("~advert_timeout_s", 3.0);
@@ -1290,7 +1362,7 @@ class BNO085Node {
     const double gyro[3] = {g[0], g[1], g[2]};
     const double* q = game ? bno_->gameQuaternion() : bno_->quaternion();
     sensor_msgs::Imu msg;
-    msg.header.stamp = ros::Time::now();
+    msg.header.stamp = bno_->stamp(game ? REPORT_GAME_ROTATION_VECTOR : REPORT_ROTATION_VECTOR);
     msg.header.frame_id = "bno_imu_link";
     msg.orientation.x = q[0];
     msg.orientation.y = q[1];
@@ -1325,9 +1397,9 @@ class BNO085Node {
 
   void publishImuHeading() { publishImuMsg(navheading_pub_, false, 1000.0); }
 
-  void publishMagMsg(ros::Publisher& pub, const double* ut) {
+  void publishMagMsg(ros::Publisher& pub, const double* ut, uint8_t report) {
     sensor_msgs::MagneticField msg;
-    msg.header.stamp = ros::Time::now();
+    msg.header.stamp = bno_->stamp(report);
     msg.header.frame_id = "bno_imu_link";
     msg.magnetic_field.x = ut[0] * 0.000001;
     msg.magnetic_field.y = ut[1] * 0.000001;
@@ -1336,7 +1408,7 @@ class BNO085Node {
     pub.publish(msg);
   }
 
-  void publishMag() { publishMagMsg(mag_pub_, bno_->magnetic()); }
+  void publishMag() { publishMagMsg(mag_pub_, bno_->magnetic(), REPORT_MAGNETOMETER); }
 
   void publishMagUncal() {
     if (mag_uncal_state_ != "on" && mag_uncal_state_ != "no data") return;
@@ -1353,7 +1425,7 @@ class BNO085Node {
     mag_uncal_sent_ = bno_->mag_uncal_count;
     mag_uncal_last_t_ = now;
     if (mag_uncal_state_ != "on") setMagUncalState("on");
-    publishMagMsg(mag_uncal_pub_, bno_->mag_uncal);
+    publishMagMsg(mag_uncal_pub_, bno_->mag_uncal, REPORT_MAG_UNCAL);
   }
 
   ros::NodeHandle nh_;

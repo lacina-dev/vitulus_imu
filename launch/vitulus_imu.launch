@@ -2,6 +2,16 @@
 
 
 <!--    #### BNO085Node publish imu and mag messages #####-->
+    <!-- T36 2026-11-21: razitko zprav IMU = cas precteni hlaseni ze sbernice misto casu
+         publikace (false = jako dosud). Zpravy, ktere opakuji stejny vzorek, pak opakuji
+         i jeho razitko, proto ZAPINAT JEN SPOLU S RYCHLYM INTERVALEM HLASENI
+         (fast_report_interval_us pod 50000): samotne dava razitka stojici 40-65 ms a
+         navi_transform pak cast vzorku RTK kurzu zahodi (uzel na to pri startu upozorni).
+         NENASAZENO, ceka na zkousku v doku. Prepinani: VITULUS_IMU_STAMP_AT_READ=true
+         v ~/.bashrc + restart stacku. ROLLBACK: promennou odebrat (vychozi false). -->
+    <arg name="imu_stamp_at_read" default="$(optenv VITULUS_IMU_STAMP_AT_READ false)"/>
+    <param name="bno085_node/stamp_at_read" value="$(arg imu_stamp_at_read)"/>
+
     <!-- T39 2026-11-16: ovladac BNO085 ma dve provedeni se stejnym jmenem uzlu, tematy,
          parametry a kody ukonceni: python = nodes/bno085_node (vychozi, jako dosud),
          cpp = src/bno085_node.cpp (binarka bno085_node_cpp; mene CPU, rovnomernejsi perioda).
