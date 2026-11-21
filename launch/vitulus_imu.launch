@@ -16,6 +16,18 @@
           name="bno085_node" pkg="vitulus_imu" type="bno085_node_cpp" respawn="true"
           respawn_delay="1" output="log"/>
 
+    <!-- T36 2026-11-21: interval hlaseni cidla pro akcelerometr, gyroskop a game rotation
+         vector [us]. 50000 (vychozi) = vsech 8 hlaseni po 20 Hz jako dosud, uzel se chova
+         beze zmeny. 5000-49999 (napr. 10000 = 100 Hz): tato tri hlaseni rychleji, /bno085/imu
+         pak nese jednu zpravu na kazdy novy vzorek (bez opakovani; kdyz game rotation vector
+         prestane chodit, opakuje posledni jako dosud). Kdyz cidlo interval neprijme, uzel se
+         sam vrati k 50000 a ohlasi to (log + bno085/health fast_report).
+         NENASAZENO, ceka na zkousku v doku. Prepinani: VITULUS_IMU_FAST_REPORT_US=10000
+         v ~/.bashrc + restart stacku (restart uzlu IMU = novy pocatek yaw).
+         ROLLBACK: promennou odebrat (vychozi 50000). -->
+    <arg name="imu_fast_report_interval_us" default="$(optenv VITULUS_IMU_FAST_REPORT_US 50000)"/>
+    <param name="bno085_node/fast_report_interval_us" value="$(arg imu_fast_report_interval_us)"/>
+
 <!--    #### Heading from the magnetometer (published and compared with RTK; navigation does not use it) #####-->
     <node name="mag_heading" pkg="vitulus_imu" type="mag_heading" respawn="true"
           respawn_delay="30" output="log">

@@ -479,6 +479,7 @@ nice -n 10 python3 -m pytest test/test_mag_heading.py -q
 nice -n 10 python3 -m pytest test/test_bno085_mag_uncal.py -q
 nice -n 10 python3 test/test_bno085_recovery.py [--old-ref REF] [--variants new,old,cpp]
 nice -n 10 python3 -m pytest test/test_bno085_equivalence.py -q
+nice -n 10 python3 -m pytest test/test_bno085_fast_report.py -q
 ```
 The bno085 tests run the Python node and, with
 `BNO085_CPP_NODE=<workspace>/devel/lib/vitulus_imu/bno085_node_cpp` in the

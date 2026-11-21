@@ -75,6 +75,8 @@ const uint8_t GET_FEATURE_RESPONSE = 0xFC;
 const uint8_t SET_FEATURE_COMMAND = 0xFD;
 
 const uint32_t DEFAULT_REPORT_INTERVAL = 50000;  // microseconds, the library default
+const long FAST_REPORT_MIN_US = 5000;            // ~fast_report_interval_us: 5000-49999, else the default
+const double FAST_REPEAT_AFTER_S = 0.05;         // no new game rotation vector for so long: repeat the last one
 const double PACKET_READ_TIMEOUT = 2.0;
 const double FEATURE_ENABLE_TIMEOUT = 2.0;
 const double SHTP_ADVERTISE_RESEND_S = 1.0;
@@ -373,6 +375,7 @@ class BoundedBNO {
   std::shared_ptr<Telemetry> tele;
   double mag_uncal[3] = {0.0, 0.0, 0.0};  // uT
   long mag_uncal_count = 0;
+  long game_count = 0;  // game rotation vector reports taken
 
   // One try only: the caller reopens the port between tries.
   void initialize() {
@@ -397,6 +400,29 @@ class BoundedBNO {
     }
     throw err(Err::Runtime, fmt("('Was not able to enable feature', %d)", feature_id));
   }
+
+  // BoundedBNO.enable_feature_at: another report interval; waits for the feature
+  // response and returns the interval the sensor took [us].
+  uint32_t enableFeatureAt(uint8_t feature_id, uint32_t interval_us) {
+    uint8_t report[17] = {0};
+    report[0] = SET_FEATURE_COMMAND;
+    report[1] = feature_id;
+    report[5] = interval_us & 0xFF;
+    report[6] = (interval_us >> 8) & 0xFF;
+    report[7] = (interval_us >> 16) & 0xFF;
+    report[8] = (interval_us >> 24) & 0xFF;
+    feature_answered_[feature_id] = false;
+    sendPacket(CHANNEL_CONTROL, report, sizeof(report));
+    const double start = monotonic();
+    while (monotonic() - start < FEATURE_ENABLE_TIMEOUT) {
+      processAvailablePackets(10);
+      if (feature_answered_[feature_id]) return feature_interval_[feature_id];
+      if (!dataReady()) sleepS(0.0005);
+    }
+    throw err(Err::Runtime, fmt("('Was not able to enable feature', %d)", feature_id));
+  }
+
+  uint32_t featureInterval(uint8_t feature_id) const { return feature_interval_[feature_id]; }
 
   void poll() { processAvailablePackets(200); }
 
@@ -671,6 +697,9 @@ class BoundedBNO {
         Reading& reading = readings_[r[1]];  // _INITIAL_REPORTS: zeros
         reading = Reading();
         reading.has = true;
+        feature_interval_[r[1]] = static_cast<uint32_t>(r[5]) | (static_cast<uint32_t>(r[6]) << 8) |
+                                  (static_cast<uint32_t>(r[7]) << 16) | (static_cast<uint32_t>(r[8]) << 24);
+        feature_answered_[r[1]] = true;
       } else if (id == COMMAND_RESPONSE) {
         if (r[2] == SAVE_DCD && r[5] != 0) throw err(Err::Runtime, "Unable to save calibration data");
       }
@@ -703,6 +732,7 @@ class BoundedBNO {
       reading.v[i] = (raw ? static_cast<double>(static_cast<uint16_t>(v)) : static_cast<double>(v)) * scalar;
     }
     reading.has = true;
+    if (id == REPORT_GAME_ROTATION_VECTOR) game_count += 1;
     if (id == REPORT_MAGNETOMETER) {
       std::lock_guard<std::mutex> lock(tele->m);
       tele->mag_accuracy = r[2] & 0x03;
@@ -716,6 +746,8 @@ class BoundedBNO {
   std::vector<const uint8_t*> slices_;
   int sequence_number_[6] = {0, 0, 0, 0, 0, 0};
   Reading readings_[256];
+  uint32_t feature_interval_[256] = {0};  // interval of the last feature response [us]
+  bool feature_answered_[256] = {false};
   bool uncal_in_packet_ = false;
   bool id_read_ = false;
 };
@@ -870,6 +902,7 @@ class BNO085Node {
     imu_status_pub_ = nh_.advertise<vitulus_msgs::Imu_status>("bno085/imu_status", 10);
     health_pub_ = nh_.advertise<std_msgs::String>("bno085/health", 1, true);
     name_ = ros::this_node::getName();
+    fast_interval_us_ = readFastInterval();
     supervisor_.start();
   }
 
@@ -887,6 +920,73 @@ class BNO085Node {
   }
 
  private:
+  // ~fast_report_interval_us as an interval the node may ask for; anything else
+  // is the default.
+  long readFastInterval() const {
+    XmlRpc::XmlRpcValue v;
+    if (!ros::param::get("~fast_report_interval_us", v)) return DEFAULT_REPORT_INTERVAL;
+    long value = -1;
+    if (v.getType() == XmlRpc::XmlRpcValue::TypeInt) {
+      value = static_cast<int>(v);
+    } else if (v.getType() == XmlRpc::XmlRpcValue::TypeDouble) {
+      const double d = static_cast<double>(v);
+      if (std::isfinite(d) && std::fabs(d) < 1e9) value = static_cast<long>(d);
+    } else if (v.getType() == XmlRpc::XmlRpcValue::TypeBoolean) {
+      value = static_cast<bool>(v) ? 1 : 0;
+    } else if (v.getType() == XmlRpc::XmlRpcValue::TypeString) {
+      const std::string text = static_cast<std::string>(v);
+      char* end = nullptr;
+      const double d = strtod(text.c_str(), &end);
+      if (end != text.c_str() && *end == '\0' && std::isfinite(d) && std::fabs(d) < 1e9)
+        value = static_cast<long>(d);
+    }
+    if (value == static_cast<long>(DEFAULT_REPORT_INTERVAL)) return value;
+    if (value < FAST_REPORT_MIN_US || value >= static_cast<long>(DEFAULT_REPORT_INTERVAL)) {
+      ROS_WARN_STREAM("<" << name_ << "> fast_report_interval_us is not within " << FAST_REPORT_MIN_US
+                          << "-" << DEFAULT_REPORT_INTERVAL << ", using " << DEFAULT_REPORT_INTERVAL);
+      return DEFAULT_REPORT_INTERVAL;
+    }
+    return value;
+  }
+
+  // One of the fast reports at ~fast_report_interval_us.  When the sensor does
+  // not take it, this report and the ones before it go back to the default
+  // interval and the node runs as without the parameter.
+  void enableFast(uint8_t feature) {
+    std::string why;
+    try {
+      const uint32_t granted = bno_->enableFeatureAt(feature, static_cast<uint32_t>(fast_interval_us_));
+      if (!(granted > 0 && granted < DEFAULT_REPORT_INTERVAL))
+        why = fmt("the sensor answered %lu us", static_cast<unsigned long>(granted));
+    } catch (const PyError& e) {
+      if (e.kind != Err::Runtime) throw;
+      why = "no answer";
+    }
+    if (why.empty()) {
+      fast_done_.push_back(feature);
+      uint32_t slowest = 0;
+      for (uint8_t f : fast_done_) slowest = std::max(slowest, bno_->featureInterval(f));
+      std::lock_guard<std::mutex> lock(state_m_);
+      fast_granted_us_ = slowest;
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_m_);
+      fast_state_ = "fallback";
+      fast_granted_us_ = DEFAULT_REPORT_INTERVAL;
+    }
+    fast_on_ = false;
+    ROS_WARN_STREAM("<" << name_ << "> report " << static_cast<int>(feature) << " at " << fast_interval_us_
+                        << " us not enabled (" << why << "), back to " << DEFAULT_REPORT_INTERVAL
+                        << " us for all reports");
+    std::vector<uint8_t> again = fast_done_;
+    again.push_back(feature);
+    for (uint8_t done : again) {
+      bno_->enableFeature(done);
+      supervisor_.beat(init_limit_s_);
+    }
+  }
+
   double backoffS() const {
     if (failures_ <= 1) return 0.0;
     return std::min(std::pow(2.0, static_cast<double>(failures_ - 2)), backoff_max_s_);
@@ -925,7 +1025,8 @@ class BNO085Node {
   // Runs in the main thread (set_state) and in the supervisor thread (1 Hz).
   void publishStatus() {
     std::lock_guard<std::mutex> pub_lock(publish_m_);
-    std::string state, reason, mag_uncal_state;
+    std::string state, reason, mag_uncal_state, fast_state;
+    unsigned long fast_granted_us;
     long failures, attempt;
     double sensor_reset_t;
     std::shared_ptr<Telemetry> tele;
@@ -938,6 +1039,8 @@ class BNO085Node {
       attempt = attempt_;
       sensor_reset_t = sensor_reset_t_;
       tele = shown_;
+      fast_state = fast_state_;
+      fast_granted_us = fast_granted_us_;
     }
     bool has_age = false, has_uncal = false;
     double age = 0.0, bias[3] = {0.0, 0.0, 0.0};
@@ -974,6 +1077,9 @@ class BNO085Node {
       json += "[" + pyRound2(bias[0]) + ", " + pyRound2(bias[1]) + ", " + pyRound2(bias[2]) + "]";
     else
       json += "null";
+    if (fast_interval_us_ != static_cast<long>(DEFAULT_REPORT_INTERVAL))
+      json += ", \"fast_report\": " + jsonString(fast_state) +
+              fmt(", \"fast_report_interval_us\": %lu", fast_granted_us);
     json += "}";
     std_msgs::String health;
     health.data = json;
@@ -1004,10 +1110,24 @@ class BNO085Node {
     bno->initialize();
     bno_ = std::move(bno);
     showBno(bno_->tele);
+    imu_sent_ = 0;
+    imu_new_t_ = monotonic();
+    fast_done_.clear();
+    fast_on_ = fast_interval_us_ != static_cast<long>(DEFAULT_REPORT_INTERVAL);
+    {
+      std::lock_guard<std::mutex> lock(state_m_);
+      fast_granted_us_ = DEFAULT_REPORT_INTERVAL;
+      fast_state_ = fast_on_ ? "on" : "pending";
+    }
     for (uint8_t feature : {REPORT_ACCELEROMETER, REPORT_GYROSCOPE, REPORT_MAGNETOMETER,
                             REPORT_ROTATION_VECTOR, REPORT_LINEAR_ACCELERATION,
                             REPORT_GEOMAGNETIC_ROTATION_VECTOR, REPORT_GAME_ROTATION_VECTOR}) {
-      bno_->enableFeature(feature);
+      const bool fast = feature == REPORT_ACCELEROMETER || feature == REPORT_GYROSCOPE ||
+                        feature == REPORT_GAME_ROTATION_VECTOR;
+      if (fast_on_ && fast)
+        enableFast(feature);
+      else
+        bno_->enableFeature(feature);
       supervisor_.beat(init_limit_s_);
     }
     {
@@ -1185,6 +1305,19 @@ class BNO085Node {
     msg.linear_acceleration.y = acc[1];
     msg.linear_acceleration.z = acc[2];
     fillCovariance(msg.linear_acceleration_covariance, acc_cov);
+    if (game && fast_on_) {  // one message per new game rotation vector
+      const double now = monotonic();
+      if (bno_->game_count != imu_sent_) {
+        imu_sent_ = bno_->game_count;
+        imu_new_t_ = now;
+      } else if (now - imu_new_t_ <= FAST_REPEAT_AFTER_S) {
+        return;
+      } else {  // the report stopped: go on as with the default interval
+        ROS_WARN_STREAM_THROTTLE(30.0, "<" << name_ << "> no game rotation vector for "
+                                           << fmt("%.2f", now - imu_new_t_)
+                                           << " s, /bno085/imu repeats the last orientation");
+      }
+    }
     if ((q[0] + q[1] + q[2] + q[3]) != 0.0) pub.publish(msg);
   }
 
@@ -1247,6 +1380,14 @@ class BNO085Node {
   long attempt_ = 0;
   double sensor_reset_t_ = 0.0;
   std::shared_ptr<Telemetry> shown_;
+
+  long fast_interval_us_ = DEFAULT_REPORT_INTERVAL;  // ~fast_report_interval_us
+  bool fast_on_ = false;                             // the fast reports run at it
+  std::string fast_state_ = "pending";               // pending | on | fallback (state_m_)
+  unsigned long fast_granted_us_ = DEFAULT_REPORT_INTERVAL;  // (state_m_)
+  std::vector<uint8_t> fast_done_;
+  long imu_sent_ = 0;
+  double imu_new_t_ = 0.0;
 
   bool mag_uncal_warned_ = false;
   long mag_uncal_sent_ = 0;
