@@ -40,6 +40,10 @@ class FakeSensor(object):
         self.corrupt_one = False
         self.refuse = set()          # feature ids it does not enable (no answer, no stream)
         self.silent_reports = set()  # enabled, but these reports stop coming
+        self.refuse_fast = False     # no answer to a feature request under 50000 us
+        self.grant = {}              # feature id -> interval it answers with (else the one asked for)
+        self.intervals = {}          # feature id -> interval it streams at [us]
+        self.requests = []           # (feature id, interval asked for)
         self.adverts = self.resets = 0
         self.features = set()
         self.seq = 0
@@ -61,6 +65,7 @@ class FakeSensor(object):
     def reset_state(self):
         with self.lock:
             self.features = set()
+            self.intervals = {}
             self.rx = bytearray()
 
     def _send(self, data):
@@ -115,15 +120,20 @@ class FakeSensor(object):
         elif channel == CH_EXE and data[:1] == b'\x01':
             self.resets += 1
             self.features = set()
+            self.intervals = {}
             self.stream_stopped = False
             self._reply(CH_EXE, b'\x01')
         elif channel == CH_CONTROL and data[:1] == b'\xf9':
             self._reply(CH_CONTROL, bytes([0xf8, 0, 3, 2]) + struct.pack('<IIH', 10003608, 7, 1) + bytes(2))
         elif channel == CH_CONTROL and data[:1] == b'\xfd':
             feature = data[1]
-            if feature in self.refuse:
+            asked = struct.unpack_from('<I', bytes(data), 5)[0]
+            self.requests.append((feature, asked))
+            if feature in self.refuse or (self.refuse_fast and asked < 50000):
                 return
-            self._reply(CH_CONTROL, bytes([0xfc, feature]) + bytes(15))
+            granted = self.grant.get(feature, asked)
+            self._reply(CH_CONTROL, struct.pack('<BBBHIII', 0xfc, feature, 0, 0, granted, 0, 0))
+            self.intervals[feature] = granted if 0 < granted < 50000 else 50000
             self.features.add(feature)
 
     def _report(self, rid, n):
@@ -133,13 +143,33 @@ class FakeSensor(object):
 
     def _streamer(self):
         n = 0
+        tick = 0.0
+        due, count = {}, {}          # reports faster than the default: own clock and counter
         while self.running:
-            time.sleep(0.05)         # the library default, 20 Hz per report
-            n += 1
+            fast = set(f for f in self.features if self.intervals.get(f, 50000) < 50000)
+            if not fast:
+                time.sleep(0.05)     # the library default, 20 Hz per report
+                slow_now = True
+            else:
+                time.sleep(0.001)
+                slow_now = time.monotonic() - tick >= 0.05
+            if slow_now:
+                tick = time.monotonic()
+                n += 1
             if self.mute or self.stream_stopped:
                 continue
+            now = time.monotonic()
+            for rid in sorted(fast):
+                if rid in REPORT_LEN and rid not in self.silent_reports and now >= due.get(rid, 0.0):
+                    step = self.intervals[rid] * 1e-6
+                    due[rid] = max(due.get(rid, now) + step, now - step)
+                    count[rid] = count.get(rid, 0) + 1
+                    self.seq += 1
+                    self._send(frame(CH_REPORTS, self.seq, bytes([0xfb, 0, 0, 0, 0]) + self._report(rid, count[rid])))
+            if not slow_now:
+                continue
             ids = sorted(self.features) if self.features else ([0x01, 0x02, 0x08] if self.pre_stream else [])
-            ids = [i for i in ids if i in REPORT_LEN and i not in self.silent_reports]
+            ids = [i for i in ids if i in REPORT_LEN and i not in self.silent_reports and i not in fast]
             for rid in ids:
                 self.seq += 1
                 payload = bytes([0xfb, 0, 0, 0, 0]) + self._report(rid, n)
