@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import traceback
+import http.client
 import xmlrpc.client
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -245,12 +246,34 @@ def run_sigterm_in_init(script, sensor, watch, old):
 
 def run_rosnode_kill_in_init(script, sensor, watch, old):
     sensor.mute = True
-    n = Node(script, sensor.path)
+    # The call is made to THIS process (not to an address the master still has from
+    # the scenario before), once it has registered, and init is long enough for that
+    # on a loaded machine.
+    n = Node(script, sensor.path, ['_advert_timeout_s:=10.0'])
     try:
-        time.sleep(2.5)
+        node = []
+
+        def registered():
+            try:
+                proxy = xmlrpc.client.ServerProxy(rosgraph.Master('/test').lookupNode('/bno085_node'))
+                if proxy.getPid('/test')[2] == n.p.pid:
+                    node.append(proxy)
+                    return True
+            except Exception:  # noqa: BLE001 - not there yet, or the address of a dead node
+                pass
+            return False
+
+        check(watch.until(registered, 15.0), 'registered at the master')
+        time.sleep(1.0)
+        check(n.alive(), 'in init')
         t0 = time.monotonic()
-        master = rosgraph.Master('/test')
-        xmlrpc.client.ServerProxy(master.lookupNode('/bno085_node')).shutdown('/test', 'test')
+        try:
+            node[-1].shutdown('/test', 'test')
+        except (OSError, http.client.HTTPException, xmlrpc.client.Error) as exc:
+            # rospy may close its XML-RPC server before the answer is out; xmlrpc.client
+            # then repeats the call and finds nobody listening (connection refused).  The
+            # request did arrive: whether it worked is the exit code below.
+            print('      (shutdown call: %s)' % exc)
         code = n.wait(5.0)
         if old:
             check(code is None, 'old ignores rosnode kill for 5 s')
@@ -258,6 +281,7 @@ def run_rosnode_kill_in_init(script, sensor, watch, old):
         check(code == 0, 'exit %r in %.2f s' % (code, time.monotonic() - t0))
     finally:
         n.kill()
+        rospy.delete_param('/bno085_node/advert_timeout_s')     # the command line left it at the master
 
 
 def run_damaged_frame(script, sensor, watch, old):
