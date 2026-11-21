@@ -967,6 +967,21 @@ class MagHeadingEstimator(object):
         'gyro_drift_deg_min': 0.2,    # drift of the game rotation vector (measured 0.12..0.19)
         'anchor_from_rtk': True,
         'max_anchor_dev_deg': 10.0,
+        # T35: a filter that started inside a disturbance (within the field
+        # gate, no RTK) keeps the disturbed correction as its 'start' anchor;
+        # out in the clean field the heading is right but the state stays
+        # 'disturbed' / 'anchor' until 0.2 deg/min x anchor age explains the
+        # step (5 uT: 7 min, 8 uT: tens of minutes).  > 0: an anchor that is
+        # not confirmed by RTK is seated again once the correction has stayed
+        # within anchor_reseat_tol_deg of one value for this many seconds of
+        # fused samples (not standing frozen, field gate passing) and that
+        # value is further than the tolerance from the anchor.  The step is
+        # remembered (anchor_moved_deg) and sigma counts it with the deviation
+        # until RTK confirms the anchor, so sigma is never below what it was
+        # without the re-seat: which of the two places was the disturbed one
+        # cannot be told without a reference.  0 (default): as before.
+        'anchor_reseat_s': 0.0,
+        'anchor_reseat_tol_deg': 3.0,
         'imu_max_age_s': 0.2,
         'stale_s': 1.0,
         # RTK heading as reference: yaw variance (rad^2, orientation_covariance[8])
@@ -1309,6 +1324,9 @@ class MagHeadingEstimator(object):
         self.frozen = False
         self.f_used_t = None     # time of the last fused sample
         self.anc = None          # anchor of the correction: (value rad, time, 'rtk' / 'start')
+        self.anc_cand = None     # re-seat candidate: [correction rad, fused s near it, time of the last look]
+        self.anc_moved = 0.0     # sum of the re-seat steps of the unconfirmed anchor (deg)
+        self.anc_reseats = 0
         self.q.clear()
 
     def _gyro_restart(self, reason):
@@ -1404,9 +1422,33 @@ class MagHeadingEstimator(object):
             a = float(circmean(list(self.anchors))) - self.cal.offset
             if math.isfinite(a):
                 self.anc = (self.f_d + wrap(a - self.f_d), t, 'rtk')
+                self.anc_cand, self.anc_moved = None, 0.0
                 return
-        if self.anc is None and self.f_W >= p['sigma_settle_s']:
+        if self.anc is None:
+            if self.f_W >= p['sigma_settle_s']:
+                self.anc = (self.f_d, t, 'start')
+                self.anc_cand, self.anc_moved = None, 0.0
+        elif p['anchor_reseat_s'] > 0.0 and self.anc[2] == 'start':
+            self._reseat(t)
+
+    def _reseat(self, t):
+        """anchor_reseat_s: seats the unconfirmed anchor again where the
+        correction has settled (see DEFAULTS)."""
+        p = self.p
+        c = self.anc_cand
+        if c is None or abs(self.f_d - c[0]) * DEG > p['anchor_reseat_tol_deg']:
+            self.anc_cand = [self.f_d, 0.0, t]
+            return
+        dt, c[2] = t - c[2], t
+        if 0.0 < dt <= 1.0 and self.f_used_t is not None and t - self.f_used_t <= p['smooth_s'] \
+                and self.f_W >= p['sigma_settle_s']:
+            c[1] += dt
+        step = abs(self.f_d - self.anc[0]) * DEG
+        if c[1] >= p['anchor_reseat_s'] and step > p['anchor_reseat_tol_deg']:
             self.anc = (self.f_d, t, 'start')
+            self.anc_moved += step
+            self.anc_reseats += 1
+            self.anc_cand = None
 
     def _deviation(self, t):
         """(deviation of the correction from the anchor, deg; the part of it
@@ -1432,7 +1474,7 @@ class MagHeadingEstimator(object):
             if meas is not None:                     # I2: never above sigma_ok_deg
                 base = min(base, max(p['sigma_min_deg'], p['sigma_rtk_k'] * meas))
         refined = abs(self.cal.refine['offset_sum_deg']) if self.cal is not None else 0.0
-        return max(base, p['sigma_k'] * (dev + (drift or 0.0))
+        return max(base, p['sigma_k'] * (dev + self.anc_moved + (drift or 0.0))
                    + p['gyro_drift_deg_min'] * hold / 60.0) + refined, hold
 
     def sigma_measured(self):
@@ -1519,6 +1561,8 @@ class MagHeadingEstimator(object):
                'anchor_dev_deg': dev, 'hold_age_s': hold,
                'dF_pct': dF, 'dIncl_deg': dI, 'gyro_std_deg': gyro_std, 'gyro_drift_deg': drift,
                'fuse_tau_eff_s': self.f_W, 'frozen': self.frozen, 'moving': self.f_moving}
+        if p['anchor_reseat_s'] > 0.0:
+            out.update(anchor_reseats=self.anc_reseats, anchor_moved_deg=self.anc_moved)
         ref = self.rtk_yaw(t)
         if ref is not None:
             err = float(wrap(yaw - ref)) * DEG
@@ -1658,6 +1702,9 @@ class MagHeadingEstimator(object):
             'motion': 'unknown' if moving is None else ('moving' if moving else 'standing'),
             'axis_weighting': bool(self.weighted),
             'resets': self.resets, 'last_reset': self.reset_reason}
+        if p['anchor_reseat_s'] > 0.0:
+            s['fusion'].update(anchor_reseat_s=p['anchor_reseat_s'], anchor_reseats=self.anc_reseats,
+                               anchor_moved_deg=r2(self.anc_moved))
         if fz and moving is None:
             s['fusion']['note'] = 'no wheel odometry: running without the standing freeze'
         cal = self.cal

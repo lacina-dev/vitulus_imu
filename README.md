@@ -218,6 +218,80 @@ heading is valid: `err_deg` (current error), and over the last
      of the `ok` outputs (RMS error 1.18°).  Status then has `sigma`:
      `from_rtk`, `ok_deg`, `min_deg`, `measured_rms_deg` (null before 30 s
      of comparisons), `measured_s`.
+
+     **Start inside a disturbance without RTK** (T35, 2026-11-21).  The
+     field gate works on the size of the field (`~max_dF_pct` 8 % of Fref
+     = 4.1 µT at Fref 51 µT) and on the inclination (`~max_dIncl_deg` 6°).
+     A disturbance across the horizontal field turns the heading and
+     changes neither much, so the gate lets it through, and without a
+     reference the filter cannot know it started on a wrong value: the
+     unconfirmed anchor only promises σ = `~sigma_start_deg` (8°).
+     Synthetic start inside a steady field across the Earth's horizontal
+     field, no RTK (`ok` share and error while inside):
+
+     | field | error | `ok` | error / σ |
+     |---|---|---|---|
+     | 5 µT | 12.4° | 96 % | 1.55 |
+     | 6 µT | 14.3° | 93 % | 1.79 |
+     | 7 µT | 16.1° | 91 % | 2.02 |
+     | 8 µT | 17.8° | 66 % | 2.23 |
+     | 9 µT | 19.5° | 32 % | 2.42 |
+     | 10 µT | 21.4° | 14 % | 2.64 |
+
+     **Limit: from about 7 µT across the horizontal field the error of an
+     `ok` output is above 2σ until RTK has been seen** (6 µT is the last
+     value below; the same field along it gives 6–9° and is gated from
+     8 µT by the inclination).  From 8 µT up `gyro_drift` and
+     `inclination` cut the `ok` share, but not to zero.  To move the limit:
+     `~sigma_start_deg` 11 covers 10 µT (21.4° / 11° = 1.9σ) at the price
+     of σ 11° for every drive before the first RTK; tighter gates
+     (`~max_dF_pct`, `~max_dIncl_deg`) do not help against a field across
+     the horizontal one and cost `ok` share on the lawn (below).  A consumer that
+     needs 2σ should take outputs with `fusion.anchor` = `rtk` only.
+
+     Measured on the robot (drives dock → lawn → dock, 2026-11-15 two
+     bags and 2026-11-18 one, live calibration, 1 s mean of the field):
+     in the dock the field is **+8.2 … +9.0 µT** over Fref (median; 16–18 %,
+     gate 8 %), the inclination +1.4 … +2.0°, the raw magnetometer heading
+     −5 … −10° off; 94–98 % of the samples fail the gate, the filter does
+     not fuse them and **no anchor is seated in the dock** (state
+     `disturbed`, `field` + `warmup`).  0.15–1 m out of the dock the field
+     is back at −0.3 … +0.8 µT (median), with the raw heading still
+     0 … +5° off in that first metre; on the lawn (> 5 m) median
+     −0.1 … +1.9 µT, 5–95 % −5 … +5.5 µT (drive current, turns), 5–16 % of
+     the samples outside the gate.  So the dock itself is far above the
+     limit and is caught by the gate; the case above needs a start in a
+     place that is off by a few µT across the horizontal field and passes
+     the gate (a car, a fence, a wall with steel).
+
+     **Re-seating the unconfirmed anchor** (`~anchor_reseat_s`, default
+     **0 = off**, as before).  After such a start the robot drives out
+     into the clean field: the heading is right within two minutes, but the
+     correction is now 12–20° from the `start` anchor and the state is
+     falsely `disturbed` / `anchor` until 0.2°/min × anchor age explains
+     it (5 µT: about 3–7 min, 6 µT and more: over 10 min).  With
+     `~anchor_reseat_s` > 0 an anchor that RTK has not confirmed is seated
+     again when the correction has stayed within `~anchor_reseat_tol_deg`
+     (3°) of one value for that many seconds of fused samples (standing
+     frozen and gated samples do not count) and that value is further
+     than the tolerance from the anchor.  The step is remembered
+     (`fusion.anchor_moved_deg`, count `fusion.anchor_reseats`; both only
+     in the status when the switch is on) and σ counts it with the
+     deviation until RTK confirms the anchor: which of the two places was
+     the disturbed one cannot be told without a reference, so σ is never
+     below what it is with the switch off; only the reason `anchor` goes.
+     An anchor confirmed by RTK is never re-seated, and when RTK arrives
+     the anchor is the RTK one within seconds, with the switch on or off.
+     Synthetic (4 min inside, then 11 min clean, `~anchor_reseat_s` 120):
+     falsely `disturbed` after leaving 167 s → 21 s (5 µT), > 558 s →
+     148 s (6 µT), > 581 s → 250 s (7 µT; σ after the re-seat 9.4°); the
+     heading is bit-identical.  Price: a robot that started clean and then
+     enters a steady disturbance without ever seeing RTK loses the reason
+     `anchor` after the same time (σ still covers the step).  On the three
+     drives above nothing is re-seated and every output is the same with
+     120 s and 300 s as with 0 (no start inside a disturbance there:
+     **not yet seen on a real drive**).  Tests:
+     `test/test_mag_heading_t35_kotva.py`.
 5. Gate as above, F = hypot(|Hc|·H0, Bz), I = atan2(−Bz, |Hc|·H0), H0 = mean semi-axis.
 6. Self-calibration: while RTK is valid (and has been for `~rtk_settle_s`,
    5 s; RTK samples that disagree with the gyro by > 15° are ignored, see
